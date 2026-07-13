@@ -34,7 +34,7 @@ from studio.production.payloads import (
     ProductionCommand,
     ProposeArtifactVersionCmd,
 )
-from studio.production.pipeline import golden_pipeline
+from studio.production.pipeline import golden_pipeline, golden_selectors
 from studio.production.process_managers import (
     ExpansionProcessManager,
     LineageProcessManager,
@@ -121,7 +121,9 @@ def build_production_stack() -> ProductionStack:
     pumps: list[SupportsPumpTick] = [
         EventPump(process_manager=PublishProcessManager(), uow_factory=factory, clock=clock),
         EventPump(
-            process_manager=ExpansionProcessManager(golden_pipeline()),
+            process_manager=ExpansionProcessManager(
+                golden_pipeline(), golden_selectors()
+            ),
             uow_factory=factory,
             clock=clock,
         ),

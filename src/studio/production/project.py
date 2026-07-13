@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
 
+from . import identity
 from .payloads import (
     ExpandStageCmd,
     InitializePipelineCmd,
@@ -45,6 +46,19 @@ class ProjectDecider:
                 )
             )
         if isinstance(command, ExpandStageCmd):
+            if not state.initialized:
+                return Rejected("not_initialized", "流水线未初始化")
+            parts = command.partitions
+            if list(parts) != sorted(set(parts)):
+                return Rejected("bad_partitions", "partitions 必须排序且唯一")
+            expected_keys = tuple(
+                sorted(
+                    identity.task_key(command.project_id, command.stage_id, p)
+                    for p in parts
+                )
+            )
+            if tuple(sorted(command.task_keys)) != expected_keys:
+                return Rejected("bad_task_keys", "task_keys 与派生不一致")
             key = _expansion_key(command.stage_id, command.driver_ref.artifact_id)
             if key in state.expanded:
                 return Rejected("already_expanded", f"{key} 已展开")

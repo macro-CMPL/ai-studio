@@ -42,6 +42,7 @@ class SeriesState(BaseModel):
     max_revision: int = 0
     current_ref: ArtifactRef | None = None
     candidates: tuple[CandidateRecord, ...] = ()
+    accepted_ids: tuple[str, ...] = ()
     stale_reasons: tuple[tuple[str, str, str], ...] = ()
 
     def candidate(self, candidate_id: str) -> CandidateRecord | None:
@@ -66,6 +67,11 @@ class ArtifactSeriesDecider:
     def _propose(
         self, state: SeriesState, command: ProposeArtifactVersionCmd
     ) -> Accepted[ProductionEvent] | Rejected:
+        expected_series = domain_ids.series_id(
+            command.project_id, command.output_key, command.partition_key
+        )
+        if command.series_id != expected_series:
+            return Rejected("forged_series", "series_id 与派生不一致")
         if compute_digest(command.payload) != command.digest:
             return Rejected("digest_mismatch", "digest 与 payload 不一致")
 
@@ -126,6 +132,8 @@ class ArtifactSeriesDecider:
     def _mark_stale(
         self, state: SeriesState, command: MarkArtifactStaleCmd
     ) -> Accepted[ProductionEvent] | Rejected:
+        if command.target_ref.artifact_id not in state.accepted_ids:
+            return Rejected("unknown_target", "目标产物未在本 series 接受")
         reason = (
             command.target_ref.artifact_id,
             command.invalidated_input_ref.artifact_id,
@@ -165,7 +173,15 @@ class ArtifactSeriesDecider:
                 }
             )
         if isinstance(event, ArtifactVersionAcceptedEvt):
-            return state.model_copy(update={"current_ref": event.artifact_ref})
+            return state.model_copy(
+                update={
+                    "current_ref": event.artifact_ref,
+                    "accepted_ids": (
+                        *state.accepted_ids,
+                        event.artifact_ref.artifact_id,
+                    ),
+                }
+            )
         if isinstance(event, ArtifactMarkedStaleEvt):
             reason = (
                 event.target_ref.artifact_id,

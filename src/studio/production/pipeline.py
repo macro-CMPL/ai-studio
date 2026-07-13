@@ -1,22 +1,28 @@
 """不可变 PipelineSpec:把展开策略从 PM 分支里抽出,编译成带 digest 的静态模板。
 
-ExpansionPM 依据注入的 spec 决定 bootstrap / fan-out / 逐分区展开,不再硬编码 stage。
+ExpansionPM 依据注入的 spec + selector registry 决定 bootstrap / fan-out / 逐分区展开。
+分区提取用可配置的 partition_selector(不再硬编码 StoryboardPayload)。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
+from studio.domain.artifacts import StoryboardPayload
 from studio.domain.enums import PropagationMode
 from studio.serialization import digest
 
+PartitionSelector = Callable[[Any], tuple[str, ...]]
+
 
 class StageMode(StrEnum):
-    ROOT_SINGLETON = "root_singleton"  # 无输入,pipeline 初始化时创建
-    FANOUT = "fanout"  # driver_stage 的产物列出分区,据此扇出
-    PER_PARTITION = "per_partition"  # 上游某分区产物接受后,1:1 创建本阶段
+    ROOT_SINGLETON = "root_singleton"
+    FANOUT = "fanout"
+    PER_PARTITION = "per_partition"
 
 
 class StageDef(BaseModel):
@@ -30,12 +36,52 @@ class StageDef(BaseModel):
     upstream_stage: str | None = None
     requirement_key: str | None = None
     propagation_mode: PropagationMode | None = None
+    partition_selector_id: str | None = None
+    partition_selector_version: str | None = None
 
 
 class PipelineSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     stages: tuple[StageDef, ...]
+
+    @model_validator(mode="after")
+    def _validate(self) -> PipelineSpec:
+        ids = [s.stage_id for s in self.stages]
+        if len(set(ids)) != len(ids):
+            raise ValueError("stage_id 必须唯一")
+        outputs = [s.output_key for s in self.stages]
+        if len(set(outputs)) != len(outputs):
+            raise ValueError("output_key 必须唯一")
+        known = set(ids)
+        for s in self.stages:
+            if s.mode is StageMode.FANOUT:
+                if s.driver_stage not in known:
+                    raise ValueError(f"{s.stage_id}: driver_stage 不存在")
+                if not s.partition_selector_id:
+                    raise ValueError(f"{s.stage_id}: FANOUT 必须声明 partition_selector_id")
+            if s.mode is StageMode.PER_PARTITION:
+                if s.upstream_stage not in known:
+                    raise ValueError(f"{s.stage_id}: upstream_stage 不存在")
+                if not s.requirement_key or s.propagation_mode is None:
+                    raise ValueError(f"{s.stage_id}: PER_PARTITION 需要 requirement/propagation")
+        self._assert_acyclic()
+        return self
+
+    def _assert_acyclic(self) -> None:
+        deps: dict[str, str | None] = {}
+        for s in self.stages:
+            deps[s.stage_id] = (
+                s.driver_stage if s.mode is StageMode.FANOUT else s.upstream_stage
+            )
+        for start in deps:
+            seen: set[str] = set()
+            node: str | None = start
+            while node is not None:
+                if node in seen:
+                    raise ValueError("PipelineSpec 存在环")
+                seen.add(node)
+                node = deps.get(node)
 
     @property
     def spec_id(self) -> str:
@@ -90,6 +136,8 @@ def golden_pipeline() -> PipelineSpec:
                 driver_stage="storyboard",
                 requirement_key="storyboard",
                 propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="storyboard_shots",
+                partition_selector_version="1",
             ),
             StageDef(
                 stage_id="image",
@@ -102,3 +150,13 @@ def golden_pipeline() -> PipelineSpec:
             ),
         )
     )
+
+
+def _storyboard_shots(payload: Any) -> tuple[str, ...]:
+    if isinstance(payload, StoryboardPayload):
+        return tuple(sorted(s.shot_id for s in payload.shots))
+    return ()
+
+
+def golden_selectors() -> dict[str, PartitionSelector]:
+    return {"storyboard_shots": _storyboard_shots}

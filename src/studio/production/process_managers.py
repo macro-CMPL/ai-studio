@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from studio.domain.artifacts import ArtifactRef, StoryboardPayload
+from studio.domain.artifacts import ArtifactRef
 from studio.domain.enums import AcceptanceMode
 from studio.kernel.envelopes import EventEnvelope
 from studio.kernel.process_manager import ProposedCommand, Reaction
@@ -29,18 +29,12 @@ from .payloads import (
     TaskAttemptCreatedEvt,
     TaskInputsBoundEvt,
 )
-from .pipeline import PipelineSpec, StageDef, StageMode
+from .pipeline import PartitionSelector, PipelineSpec, StageDef, StageMode
 from .values import BindingItem
 
 
 def _frozen() -> ConfigDict:
     return ConfigDict(frozen=True)
-
-
-def _partitions_of(payload: object) -> tuple[str, ...]:
-    if isinstance(payload, StoryboardPayload):
-        return tuple(sorted(s.shot_id for s in payload.shots))
-    return ()
 
 
 def _create_attempt(
@@ -128,12 +122,12 @@ class AcceptedRefEntry(BaseModel):
 class ProjectExpansion(BaseModel):
     model_config = _frozen()
     project_id: str
-    partitions_by_output: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    partitions_by_candidate: tuple[tuple[str, tuple[str, ...]], ...] = ()
     accepted: tuple[AcceptedRefEntry, ...] = ()
 
-    def partitions(self, output_key: str) -> tuple[str, ...]:
+    def partitions(self, candidate_id: str) -> tuple[str, ...]:
         return next(
-            (parts for (ok, parts) in self.partitions_by_output if ok == output_key),
+            (parts for (cid, parts) in self.partitions_by_candidate if cid == candidate_id),
             (),
         )
 
@@ -156,8 +150,11 @@ class ExpansionState(BaseModel):
 class ExpansionProcessManager:
     pm_id = "expansion-pm"
 
-    def __init__(self, spec: PipelineSpec) -> None:
+    def __init__(
+        self, spec: PipelineSpec, selectors: dict[str, PartitionSelector]
+    ) -> None:
         self._spec = spec
+        self._selectors = selectors
 
     def initial_state(self) -> ExpansionState:
         return ExpansionState()
@@ -203,15 +200,26 @@ class ExpansionProcessManager:
     def _cache_partitions(
         self, state: ExpansionState, payload: ArtifactCandidateProducedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
-        parts = _partitions_of(payload.payload)
+        # 只有作为某 FANOUT 阶段 driver 的 candidate 才用其 selector 提取分区,
+        # 并**按 candidate_id 缓存**(避免乱序接受时绑定到别的 candidate 的分区)。
+        fanouts = self._spec.fanout_driven_by(payload.output_key)
+        if not fanouts:
+            return Reaction(state=state, commands=())
+        selector_id = fanouts[0].partition_selector_id
+        selector = self._selectors.get(selector_id) if selector_id else None
+        if selector is None:
+            return Reaction(state=state, commands=())
+        parts = selector(payload.payload)
         if not parts:
             return Reaction(state=state, commands=())
         proj = state.project(payload.project_id)
-        others = tuple(
-            e for e in proj.partitions_by_output if e[0] != payload.output_key
-        )
         updated = proj.model_copy(
-            update={"partitions_by_output": (*others, (payload.output_key, parts))}
+            update={
+                "partitions_by_candidate": (
+                    *proj.partitions_by_candidate,
+                    (payload.candidate_id, parts),
+                )
+            }
         )
         return Reaction(state=state.with_project(updated), commands=())
 
@@ -228,9 +236,9 @@ class ExpansionProcessManager:
         new_state = state.with_project(proj)
         commands: list[ProposedCommand[ProductionCommand]] = []
 
-        # FANOUT:本产物是某扇出阶段的 driver
+        # FANOUT:本产物是某扇出阶段的 driver;分区取自**该 candidate** 的缓存
         for stage in self._spec.fanout_driven_by(payload.output_key):
-            partitions = tuple(sorted(set(proj.partitions(payload.output_key))))
+            partitions = tuple(sorted(set(proj.partitions(payload.candidate_id))))
             task_keys = tuple(
                 sorted(
                     identity.task_key(payload.project_id, stage.stage_id, p)
@@ -341,6 +349,7 @@ class CurrentRef(BaseModel):
     model_config = _frozen()
     series_id: str
     ref: ArtifactRef
+    accepted_event_id: str
 
 
 class LineageState(BaseModel):
@@ -361,9 +370,8 @@ class LineageState(BaseModel):
         found = next((t for t in self.targets if t.attempt_id == attempt_id), None)
         return found.ref if found is not None else None
 
-    def current_of(self, series_id: str) -> ArtifactRef | None:
-        found = next((c for c in self.current if c.series_id == series_id), None)
-        return found.ref if found is not None else None
+    def current_of(self, series_id: str) -> CurrentRef | None:
+        return next((c for c in self.current if c.series_id == series_id), None)
 
 
 def _stale_cmd(
@@ -440,7 +448,11 @@ class LineageProcessManager:
                 "targets": (*state.targets, target_entry),
                 "current": (
                     *others,
-                    CurrentRef(series_id=payload.series_id, ref=payload.artifact_ref),
+                    CurrentRef(
+                        series_id=payload.series_id,
+                        ref=payload.artifact_ref,
+                        accepted_event_id=event.event_id,
+                    ),
                 ),
             }
         )
@@ -473,13 +485,14 @@ class LineageProcessManager:
         if meta is not None:
             for binding in new_state.inputs_of(payload.produced_by_attempt):
                 current = new_state.current_of(binding.series_id)
-                if current is not None and current.artifact_id != binding.artifact_id:
+                if current is not None and current.ref.artifact_id != binding.artifact_id:
                     commands.append(
                         _stale_cmd(
                             target_ref=payload.artifact_ref,
                             invalidated=binding.to_ref(),
-                            replacement=current,
-                            root_cause_event_id=event.event_id,
+                            replacement=current.ref,
+                            # root cause 指向上游 replacement 的接受事件,而非本下游事件
+                            root_cause_event_id=current.accepted_event_id,
                             binding=binding,
                             meta=meta,
                         )

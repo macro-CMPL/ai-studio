@@ -11,7 +11,13 @@ from kernel_helpers import FakeClock
 from production_helpers import build_production_stack, init_command
 from studio.application.routing_worker import RoutingCommandWorker
 from studio.domain import ids as domain_ids
-from studio.domain.artifacts import ArtifactRef, ImagePayload
+from studio.domain.artifacts import (
+    ArtifactRef,
+    ImagePayload,
+    ScriptPayload,
+    ShotSpec,
+    StoryboardPayload,
+)
 from studio.domain.enums import (
     AcceptanceMode,
     CurrencyStatus,
@@ -30,18 +36,28 @@ from studio.production import identity
 from studio.production.attempt import TaskAttemptDecider
 from studio.production.dispatch import canonical_target
 from studio.production.payloads import (
+    ArtifactCandidateProducedEvt,
     ArtifactMarkedStaleEvt,
     ArtifactVersionAcceptedEvt,
     CreateTaskAttemptCmd,
     ExpandStageCmd,
     InitializePipelineCmd,
     MarkArtifactStaleCmd,
+    PipelineInitializedEvt,
     ProductionEvent,
     ProposeArtifactVersionCmd,
     TaskAttemptCreatedEvt,
     TaskInputsBoundEvt,
 )
+from studio.production.pipeline import (
+    PipelineSpec,
+    StageDef,
+    StageMode,
+    golden_pipeline,
+    golden_selectors,
+)
 from studio.production.process_managers import (
+    ExpansionProcessManager,
     LineageProcessManager,
     RecomputeProcessManager,
 )
@@ -214,8 +230,14 @@ def test_series_decider_digest_and_candidate_conflict() -> None:
 def test_stage_can_reexpand_with_new_driver() -> None:
     decider = ProjectDecider()
     state = decider.initial_state()
+    init = decider.decide(state, InitializePipelineCmd(project_id="p", pipeline_spec_id="s"))
+    assert isinstance(init, Accepted)
+    for pe in init.events:
+        state = decider.evolve(state, pe.payload)
+
     driver_v1 = _ref(domain_ids.series_id("p", "storyboard", None), 1)
     driver_v2 = _ref(domain_ids.series_id("p", "storyboard", None), 2, "b" * 64)
+    task_keys = (identity.task_key("p", "plan", "shot_01"),)
 
     def expand(driver: ArtifactRef) -> ExpandStageCmd:
         return ExpandStageCmd(
@@ -223,7 +245,7 @@ def test_stage_can_reexpand_with_new_driver() -> None:
             stage_id="plan",
             driver_ref=driver,
             partitions=("shot_01",),
-            task_keys=("tk1",),
+            task_keys=task_keys,
         )
 
     d1 = decider.decide(state, expand(driver_v1))
@@ -278,6 +300,8 @@ def test_lineage_marks_late_downstream_stale() -> None:
     assert stale[0].target_ref.artifact_id == t_v1.artifact_id
     assert stale[0].invalidated_input_ref.artifact_id == a_v1.artifact_id
     assert stale[0].replacement_ref.artifact_id == a_v2.artifact_id
+    # root cause 必须指向上游 replacement(A-v2)的接受事件(evt-3),而非下游自身(evt-4)
+    assert stale[0].root_cause_event_id == "evt-3"
 
 
 # --- Blocker 5:多输入失效累计 --- #
@@ -329,3 +353,134 @@ def test_projection_unknown_artifact_raises() -> None:
     view = ArtifactLifecycleView.build([])
     with pytest.raises(LookupError):
         view.currency("nope")
+
+
+# --- Blocker 1(补):candidate 乱序接受仍绑定各自 partitions --- #
+
+
+def test_expansion_binds_partitions_per_candidate() -> None:
+    pm = ExpansionProcessManager(golden_pipeline(), golden_selectors())
+    project = "p"
+    sb_series = domain_ids.series_id(project, "storyboard", None)
+    sb_ref = _ref(sb_series, 1)
+
+    events: list[ProductionEvent] = [
+        PipelineInitializedEvt(
+            project_id=project, pipeline_spec_id=golden_pipeline().spec_id
+        ),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c1", attempt_id="att-1", project_id=project,
+            series_id=sb_series, output_key="storyboard", partition_key=None,
+            digest="a" * 64,
+            payload=StoryboardPayload(shots=(ShotSpec(shot_id="shot_A", description="d"),)),
+        ),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c2", attempt_id="att-2", project_id=project,
+            series_id=sb_series, output_key="storyboard", partition_key=None,
+            digest="b" * 64,
+            payload=StoryboardPayload(shots=(ShotSpec(shot_id="shot_B", description="d"),)),
+        ),
+        ArtifactVersionAcceptedEvt(
+            project_id=project, series_id=sb_series, revision=1, artifact_ref=sb_ref,
+            previous_current_ref=None, candidate_id="c1", produced_by_attempt="att-1",
+            output_key="storyboard", partition_key=None,
+        ),
+    ]
+    commands = _run_pm(pm, events)
+    expands = [c.payload for c in commands if isinstance(c.payload, ExpandStageCmd)]
+    assert len(expands) == 1
+    assert expands[0].partitions == ("shot_A",)  # 用 c1 的分区,而非 c2 的 shot_B
+
+
+# --- Blocker 2(补):非 Storyboard 的可配置 FANOUT selector --- #
+
+
+def test_configurable_fanout_selector() -> None:
+    spec = PipelineSpec(
+        stages=(
+            StageDef(
+                stage_id="root", output_key="root", logical_slot="root",
+                mode=StageMode.ROOT_SINGLETON,
+            ),
+            StageDef(
+                stage_id="leaf", output_key="leaf", logical_slot="leaf",
+                mode=StageMode.FANOUT, driver_stage="root", requirement_key="root",
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="twoparts", partition_selector_version="1",
+            ),
+        )
+    )
+    selectors = {"twoparts": lambda payload: ("p1", "p2")}
+    pm = ExpansionProcessManager(spec, selectors)
+    project = "p"
+    root_series = domain_ids.series_id(project, "root", None)
+    root_ref = _ref(root_series, 1)
+    events: list[ProductionEvent] = [
+        PipelineInitializedEvt(project_id=project, pipeline_spec_id=spec.spec_id),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c1", attempt_id="att-1", project_id=project,
+            series_id=root_series, output_key="root", partition_key=None,
+            digest="a" * 64,
+            payload=ScriptPayload(title="t", logline="l", beats=("b",)),
+        ),
+        ArtifactVersionAcceptedEvt(
+            project_id=project, series_id=root_series, revision=1, artifact_ref=root_ref,
+            previous_current_ref=None, candidate_id="c1", produced_by_attempt="att-1",
+            output_key="root", partition_key=None,
+        ),
+    ]
+    commands = _run_pm(pm, events)
+    expands = [c.payload for c in commands if isinstance(c.payload, ExpandStageCmd)]
+    assert len(expands) == 1
+    assert expands[0].partitions == ("p1", "p2")
+
+
+# --- Blocker 3(补):forged series 与不存在 target 的 stale 被拒 --- #
+
+
+def test_series_rejects_forged_series_and_unknown_stale_target() -> None:
+    decider = ArtifactSeriesDecider()
+    payload = ImagePayload(shot_id="shot_01", prompt="a", blob_ref="b")
+    from studio.serialization import digest
+
+    forged = ProposeArtifactVersionCmd(
+        project_id="p", series_id="not-canonical", candidate_id="c1",
+        output_key="image", partition_key="shot_01", digest=digest(payload),
+        payload=payload, acceptance_mode=AcceptanceMode.AUTO, produced_by_attempt="att",
+    )
+    assert decider.decide(decider.initial_state(), forged).code == "forged_series"  # type: ignore[union-attr]
+
+    series = domain_ids.series_id("p", "image", "shot_01")
+    ghost = _ref(series, 99)
+    stale = MarkArtifactStaleCmd(
+        target_ref=ghost, invalidated_input_ref=_ref(series, 1),
+        replacement_ref=_ref(series, 2, "b" * 64), root_cause_event_id="e",
+        scope=PropagationMode.PARTITION_PRESERVING, task_key="tk", partition_key="shot_01",
+    )
+    assert decider.decide(decider.initial_state(), stale).code == "unknown_target"  # type: ignore[union-attr]
+
+
+# --- Blocker 3(补):ProjectDecider 校验 partitions/task_keys --- #
+
+
+def test_project_rejects_bad_partitions_and_task_keys() -> None:
+    decider = ProjectDecider()
+    state = decider.initial_state()
+    init = decider.decide(state, InitializePipelineCmd(project_id="p", pipeline_spec_id="s"))
+    assert isinstance(init, Accepted)
+    for pe in init.events:
+        state = decider.evolve(state, pe.payload)
+
+    driver = _ref(domain_ids.series_id("p", "storyboard", None), 1)
+    bad_parts = ExpandStageCmd(
+        project_id="p", stage_id="plan", driver_ref=driver,
+        partitions=("z", "a", "a"), task_keys=("x",),
+    )
+    assert decider.decide(state, bad_parts).code == "bad_partitions"  # type: ignore[union-attr]
+
+    good_parts = ("shot_01", "shot_02")
+    bad_keys = ExpandStageCmd(
+        project_id="p", stage_id="plan", driver_ref=driver,
+        partitions=good_parts, task_keys=("wrong",),
+    )
+    assert decider.decide(state, bad_keys).code == "bad_task_keys"  # type: ignore[union-attr]
