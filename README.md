@@ -26,7 +26,11 @@
 
 - [x] **M1 契约与领域对象** — 枚举、不可变产物 + payload 判别联合、Stage 模板、
       TaskAttempt/ProviderOperation、预算账本条目、canonical 序列化与摘要。
-- [ ] M2 Event / Command / Process Manager 内核(事务性 Inbox + Outbox)
+- [x] **M2 Event/Command/Process Manager 内核** — 泛型 Decider(decide/evolve)+
+      ProcessManager(react 返回新状态+命令);EventEnvelope/CommandEnvelope;
+      稳定 event_key 派生确定性 event_id;事务性写缓冲 UoW(校验-全部→应用-全部,
+      真实乐观并发 + 幂等冲突检测);ProcessedCommand 结果去重;三阶段独立 Tick
+      (Command Worker / Event Pump / Outbox Relay)+ 公平 Driver;崩溃恢复接缝。
 - [ ] M3 Artifact Lineage 与动态 Stage 展开
 - [ ] M4 幂等 Provider 与 BudgetLedger
 - [ ] M5 完整 QC 回流 Golden Scenario(P0A 垂直切片)
