@@ -34,7 +34,7 @@ from studio.production.payloads import (
     ProductionCommand,
     ProposeArtifactVersionCmd,
 )
-from studio.production.pipeline import golden_pipeline, golden_selectors
+from studio.production.pipeline import golden_compiled, golden_selectors
 from studio.production.process_managers import (
     ExpansionProcessManager,
     LineageProcessManager,
@@ -122,7 +122,7 @@ def build_production_stack() -> ProductionStack:
         EventPump(process_manager=PublishProcessManager(), uow_factory=factory, clock=clock),
         EventPump(
             process_manager=ExpansionProcessManager(
-                golden_pipeline(), golden_selectors()
+                golden_compiled(), golden_selectors()
             ),
             uow_factory=factory,
             clock=clock,
@@ -149,7 +149,7 @@ def init_command(
         causation_id=None,
         issued_at=_ISSUED_AT,
         payload=InitializePipelineCmd(
-            project_id=project_id, pipeline_spec_id=golden_pipeline().spec_id
+            project_id=project_id, pipeline_spec_id=golden_compiled().spec_id
         ),
     )
 

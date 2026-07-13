@@ -20,9 +20,23 @@ from studio.domain.artifacts import (
 )
 from studio.domain.enums import (
     AcceptanceMode,
+    ArtifactType,
+    CardinalityKind,
+    ControlRole,
+    CostMode,
     CurrencyStatus,
     DependencyStatus,
+    ExecutorKind,
+    PartitioningKind,
     PropagationMode,
+    ToolEffectLevel,
+)
+from studio.domain.stages import (
+    Cardinality,
+    OutputSpec,
+    Partitioning,
+    Requirement,
+    StageSpec,
 )
 from studio.infrastructure.memory._state import MemoryDatabase
 from studio.infrastructure.memory.unit_of_work import (
@@ -34,6 +48,7 @@ from studio.kernel.envelopes import CommandEnvelope, EventEnvelope
 from studio.kernel.errors import ContractViolation, IdempotencyConflict
 from studio.production import identity
 from studio.production.attempt import TaskAttemptDecider
+from studio.production.compile import CompilationError, compile_from
 from studio.production.dispatch import canonical_target
 from studio.production.payloads import (
     ArtifactCandidateProducedEvt,
@@ -49,13 +64,7 @@ from studio.production.payloads import (
     TaskAttemptCreatedEvt,
     TaskInputsBoundEvt,
 )
-from studio.production.pipeline import (
-    PipelineSpec,
-    StageDef,
-    StageMode,
-    golden_pipeline,
-    golden_selectors,
-)
+from studio.production.pipeline import golden_compiled, golden_selectors
 from studio.production.process_managers import (
     ExpansionProcessManager,
     LineageProcessManager,
@@ -359,14 +368,14 @@ def test_projection_unknown_artifact_raises() -> None:
 
 
 def test_expansion_binds_partitions_per_candidate() -> None:
-    pm = ExpansionProcessManager(golden_pipeline(), golden_selectors())
+    pm = ExpansionProcessManager(golden_compiled(), golden_selectors())
     project = "p"
     sb_series = domain_ids.series_id(project, "storyboard", None)
     sb_ref = _ref(sb_series, 1)
 
     events: list[ProductionEvent] = [
         PipelineInitializedEvt(
-            project_id=project, pipeline_spec_id=golden_pipeline().spec_id
+            project_id=project, pipeline_spec_id=golden_compiled().spec_id
         ),
         ArtifactCandidateProducedEvt(
             candidate_id="c1", attempt_id="att-1", project_id=project,
@@ -396,21 +405,13 @@ def test_expansion_binds_partitions_per_candidate() -> None:
 
 
 def test_configurable_fanout_selector() -> None:
-    spec = PipelineSpec(
-        stages=(
-            StageDef(
-                stage_id="root", output_key="root", logical_slot="root",
-                mode=StageMode.ROOT_SINGLETON,
-            ),
-            StageDef(
-                stage_id="leaf", output_key="leaf", logical_slot="leaf",
-                mode=StageMode.FANOUT, driver_stage="root", requirement_key="root",
-                propagation_mode=PropagationMode.AGGREGATE,
-                partition_selector_id="twoparts", partition_selector_version="1",
-            ),
+    spec = compile_from(
+        (
+            _producer_stage("root", ArtifactType.SCRIPT, "root"),
+            _fanout_stage("leaf", "leaf", ArtifactType.SCRIPT, "root", "twoparts"),
         )
     )
-    selectors = {"twoparts": lambda payload: ("p1", "p2")}
+    selectors = {("twoparts", "1"): lambda payload: ("p1", "p2")}
     pm = ExpansionProcessManager(spec, selectors)
     project = "p"
     root_series = domain_ids.series_id(project, "root", None)
@@ -484,3 +485,213 @@ def test_project_rejects_bad_partitions_and_task_keys() -> None:
         partitions=good_parts, task_keys=("wrong",),
     )
     assert decider.decide(state, bad_keys).code == "bad_task_keys"  # type: ignore[union-attr]
+
+
+# --- StageSpec 构造助手(用于编译器/展开测试) --- #
+
+
+def _producer_stage(stage_id: str, artifact_type: ArtifactType, slot: str) -> StageSpec:
+    return StageSpec(
+        stage_id=stage_id,
+        executor_kind=ExecutorKind.AGENT,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        requires=(),
+        produces=(
+            OutputSpec(
+                artifact_type=artifact_type,
+                logical_slot=slot,
+                schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.SINGLETON),
+            ),
+        ),
+    )
+
+
+def _fanout_stage(
+    stage_id: str,
+    out_slot: str,
+    driver_type: ArtifactType,
+    driver_slot: str,
+    selector_id: str,
+    version: str = "1",
+) -> StageSpec:
+    return StageSpec(
+        stage_id=stage_id,
+        executor_kind=ExecutorKind.AGENT,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=driver_type,
+                logical_slot=driver_slot,
+                cardinality=Cardinality(
+                    kind=CardinalityKind.DYNAMIC_PARTITION_BY, partition_by="k"
+                ),
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id=selector_id,
+                partition_selector_version=version,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE,
+                logical_slot=out_slot,
+                schema_version=1,
+                partitioning=Partitioning(
+                    kind=PartitioningKind.DYNAMIC_FROM, from_key="k"
+                ),
+            ),
+        ),
+    )
+
+
+def _accept_root(project: str, slot: str) -> list[ProductionEvent]:
+    series = domain_ids.series_id(project, slot, None)
+    return [
+        PipelineInitializedEvt(project_id=project, pipeline_spec_id="ignored"),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c1", attempt_id="att-1", project_id=project,
+            series_id=series, output_key=slot, partition_key=None, digest="a" * 64,
+            payload=ScriptPayload(title="t", logline="l", beats=("b",)),
+        ),
+        ArtifactVersionAcceptedEvt(
+            project_id=project, series_id=series, revision=1, artifact_ref=_ref(series, 1),
+            previous_current_ref=None, candidate_id="c1", produced_by_attempt="att-1",
+            output_key=slot, partition_key=None,
+        ),
+    ]
+
+
+def test_double_fanout_uses_own_selectors() -> None:
+    spec = compile_from(
+        (
+            _producer_stage("root", ArtifactType.SCRIPT, "root"),
+            _fanout_stage("left", "left", ArtifactType.SCRIPT, "root", "selL"),
+            _fanout_stage("right", "right", ArtifactType.SCRIPT, "root", "selR"),
+        )
+    )
+    selectors = {
+        ("selL", "1"): lambda p: ("Lp",),
+        ("selR", "1"): lambda p: ("Rp",),
+    }
+    pm = ExpansionProcessManager(spec, selectors)
+    events = _accept_root("p", "root")
+    events[0] = PipelineInitializedEvt(project_id="p", pipeline_spec_id=spec.spec_id)
+    commands = _run_pm(pm, events)
+    by_stage = {
+        c.payload.stage_id: c.payload.partitions
+        for c in commands
+        if isinstance(c.payload, ExpandStageCmd)
+    }
+    assert by_stage == {"left": ("Lp",), "right": ("Rp",)}
+
+
+def test_selector_version_mismatch_fails_fast() -> None:
+    spec = compile_from(
+        (
+            _producer_stage("root", ArtifactType.SCRIPT, "root"),
+            _fanout_stage("leaf", "leaf", ArtifactType.SCRIPT, "root", "sel", version="2"),
+        )
+    )
+    with pytest.raises(ValueError):
+        ExpansionProcessManager(spec, {("sel", "1"): lambda p: ("x",)})
+
+
+def test_series_rejects_forged_target_digest() -> None:
+    from studio.serialization import digest
+
+    decider = ArtifactSeriesDecider()
+    series = domain_ids.series_id("p", "image", "shot_01")
+    payload = ImagePayload(shot_id="shot_01", prompt="a", blob_ref="b")
+    propose = ProposeArtifactVersionCmd(
+        project_id="p", series_id=series, candidate_id="c1", output_key="image",
+        partition_key="shot_01", digest=digest(payload), payload=payload,
+        acceptance_mode=AcceptanceMode.AUTO, produced_by_attempt="att",
+    )
+    state = decider.initial_state()
+    decision = decider.decide(state, propose)
+    assert isinstance(decision, Accepted)
+    for pe in decision.events:
+        state = decider.evolve(state, pe.payload)
+
+    real_ref = _ref(series, 1, digest(payload))
+    forged = real_ref.model_copy(update={"digest": "f" * 64})
+    stale = MarkArtifactStaleCmd(
+        target_ref=forged, invalidated_input_ref=_ref(series, 1),
+        replacement_ref=_ref(series, 2, "b" * 64), root_cause_event_id="e",
+        scope=PropagationMode.PARTITION_PRESERVING, task_key="tk", partition_key="shot_01",
+    )
+    assert decider.decide(state, stale).code == "unknown_target"  # type: ignore[union-attr]
+
+
+def test_project_rejects_unsorted_task_keys() -> None:
+    decider = ProjectDecider()
+    state = decider.initial_state()
+    init = decider.decide(state, InitializePipelineCmd(project_id="p", pipeline_spec_id="s"))
+    assert isinstance(init, Accepted)
+    for pe in init.events:
+        state = decider.evolve(state, pe.payload)
+
+    driver = _ref(domain_ids.series_id("p", "storyboard", None), 1)
+    parts = ("shot_01", "shot_02")
+    expected = tuple(sorted(identity.task_key("p", "plan", s) for s in parts))
+    reversed_keys = tuple(reversed(expected))
+    cmd = ExpandStageCmd(
+        project_id="p", stage_id="plan", driver_ref=driver,
+        partitions=parts, task_keys=reversed_keys,
+    )
+    if reversed_keys != expected:  # 若恰好相同则跳过(概率极低)
+        assert decider.decide(state, cmd).code == "bad_task_keys"  # type: ignore[union-attr]
+
+
+def test_compiler_rejects_ambiguous_producer() -> None:
+    with pytest.raises(CompilationError):
+        compile_from(
+            (
+                _producer_stage("a", ArtifactType.SCRIPT, "dup"),
+                _producer_stage("b", ArtifactType.SCRIPT, "dup"),
+                _fanout_stage("c", "c", ArtifactType.SCRIPT, "dup", "sel"),
+            )
+        )
+
+
+def test_compiler_preserves_multi_input_and_stable_digest() -> None:
+    consumer = StageSpec(
+        stage_id="consumer",
+        executor_kind=ExecutorKind.TRANSFORM,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.METERED,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="s1",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.AGGREGATE,
+            ),
+            Requirement(
+                artifact_type=ArtifactType.STORYBOARD, logical_slot="s2",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.AGGREGATE,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.STITCH, logical_slot="out", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    stages = (
+        _producer_stage("p1", ArtifactType.SCRIPT, "s1"),
+        _producer_stage("p2", ArtifactType.STORYBOARD, "s2"),
+        consumer,
+    )
+    spec = compile_from(stages)
+    compiled_consumer = spec.by_stage("consumer")
+    assert compiled_consumer is not None
+    assert len(compiled_consumer.requirements) == 2
+    # 稳定 digest
+    assert compile_from(stages).spec_id == spec.spec_id

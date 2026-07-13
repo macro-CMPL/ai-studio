@@ -32,6 +32,7 @@ from studio.domain.enums import (
     LedgerEntryType,
     LedgerSubjectType,
     PartitioningKind,
+    PropagationMode,
     ProviderOpStatus,
     ToolEffectLevel,
 )
@@ -336,6 +337,9 @@ def test_provider_stage_allows_costed_tools() -> None:
                     kind=CardinalityKind.DYNAMIC_PARTITION_BY,
                     partition_by="shot_id",
                 ),
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="storyboard_shots",
+                partition_selector_version="1",
             ),
         ),
         produces=(

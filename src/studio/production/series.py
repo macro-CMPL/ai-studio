@@ -42,7 +42,7 @@ class SeriesState(BaseModel):
     max_revision: int = 0
     current_ref: ArtifactRef | None = None
     candidates: tuple[CandidateRecord, ...] = ()
-    accepted_ids: tuple[str, ...] = ()
+    accepted_refs: tuple[ArtifactRef, ...] = ()
     stale_reasons: tuple[tuple[str, str, str], ...] = ()
 
     def candidate(self, candidate_id: str) -> CandidateRecord | None:
@@ -132,8 +132,8 @@ class ArtifactSeriesDecider:
     def _mark_stale(
         self, state: SeriesState, command: MarkArtifactStaleCmd
     ) -> Accepted[ProductionEvent] | Rejected:
-        if command.target_ref.artifact_id not in state.accepted_ids:
-            return Rejected("unknown_target", "目标产物未在本 series 接受")
+        if command.target_ref not in state.accepted_refs:
+            return Rejected("unknown_target", "目标 ArtifactRef 未在本 series 接受")
         reason = (
             command.target_ref.artifact_id,
             command.invalidated_input_ref.artifact_id,
@@ -176,10 +176,7 @@ class ArtifactSeriesDecider:
             return state.model_copy(
                 update={
                     "current_ref": event.artifact_ref,
-                    "accepted_ids": (
-                        *state.accepted_ids,
-                        event.artifact_ref.artifact_id,
-                    ),
+                    "accepted_refs": (*state.accepted_refs, event.artifact_ref),
                 }
             )
         if isinstance(event, ArtifactMarkedStaleEvt):

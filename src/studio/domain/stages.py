@@ -18,6 +18,7 @@ from .enums import (
     CostMode,
     ExecutorKind,
     PartitioningKind,
+    PropagationMode,
     ToolEffectLevel,
 )
 
@@ -50,13 +51,29 @@ class Cardinality(FrozenModel):
 
 
 class Requirement(FrozenModel):
-    """一个 Stage 对上游产物的输入依赖声明。"""
+    """一个 Stage 对上游产物的输入依赖声明。
+
+    propagation_mode 显式声明失效传播范围(不由 cardinality 推测)。
+    DYNAMIC_PARTITION_BY 的 Requirement 必须声明带版本的 partition selector。
+    """
 
     artifact_type: ArtifactType
     logical_slot: str
-    partition_selector: str | None = None
     acceptance_filter: AcceptanceStatus = AcceptanceStatus.ACCEPTED
     cardinality: Cardinality
+    propagation_mode: PropagationMode
+    partition_selector_id: str | None = None
+    partition_selector_version: str | None = None
+
+    @model_validator(mode="after")
+    def _check_selector(self) -> Requirement:
+        dyn = self.cardinality.kind is CardinalityKind.DYNAMIC_PARTITION_BY
+        has_selector = bool(self.partition_selector_id and self.partition_selector_version)
+        if dyn and not has_selector:
+            raise ValueError(
+                "DYNAMIC_PARTITION_BY 的 Requirement 必须声明 selector id + version"
+            )
+        return self
 
 
 class OutputSpec(FrozenModel):

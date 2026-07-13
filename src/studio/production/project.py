@@ -57,8 +57,8 @@ class ProjectDecider:
                     for p in parts
                 )
             )
-            if tuple(sorted(command.task_keys)) != expected_keys:
-                return Rejected("bad_task_keys", "task_keys 与派生不一致")
+            if command.task_keys != expected_keys:
+                return Rejected("bad_task_keys", "task_keys 与派生(排序)不一致")
             key = _expansion_key(command.stage_id, command.driver_ref.artifact_id)
             if key in state.expanded:
                 return Rejected("already_expanded", f"{key} 已展开")
