@@ -1,0 +1,140 @@
+"""ArtifactSeriesDecider(artifact-series 流):分配 revision、接受、记录 stale 事实。
+
+- revision 由本 decider 依据 series 状态单调分配(杜绝并发 attempt 各自认领同一 revision)。
+- candidate_id 去重:同一 candidate 即使命令 ID 因异常路径改变,也不再分配第二个 revision。
+- stale 采用"原因级"幂等:(target, invalidated, replacement) 相同才视为重复。
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict
+
+from studio.domain import ids as domain_ids
+from studio.domain.artifacts import ArtifactRef
+from studio.domain.enums import AcceptanceMode
+from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
+
+from .payloads import (
+    ArtifactMarkedStaleEvt,
+    ArtifactVersionAcceptedEvt,
+    ArtifactVersionProposedEvt,
+    MarkArtifactStaleCmd,
+    ProductionCommand,
+    ProductionEvent,
+    ProposeArtifactVersionCmd,
+)
+
+
+class SeriesState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    max_revision: int = 0
+    current_ref: ArtifactRef | None = None
+    candidates: tuple[str, ...] = ()
+    stale_reasons: tuple[tuple[str, str, str], ...] = ()
+
+
+class ArtifactSeriesDecider:
+    def initial_state(self) -> SeriesState:
+        return SeriesState()
+
+    def decide(
+        self, state: SeriesState, command: ProductionCommand
+    ) -> Accepted[ProductionEvent] | Rejected:
+        if isinstance(command, ProposeArtifactVersionCmd):
+            return self._propose(state, command)
+        if isinstance(command, MarkArtifactStaleCmd):
+            return self._mark_stale(state, command)
+        return Rejected("unexpected_command", f"series 流不处理 {command.type}")
+
+    def _propose(
+        self, state: SeriesState, command: ProposeArtifactVersionCmd
+    ) -> Accepted[ProductionEvent] | Rejected:
+        if command.candidate_id in state.candidates:
+            return Accepted(())  # 幂等:同一 candidate 不再分配新 revision
+        revision = state.max_revision + 1
+        ref = ArtifactRef(
+            artifact_id=domain_ids.artifact_id(command.series_id, revision),
+            series_id=command.series_id,
+            revision=revision,
+            digest=command.digest,
+        )
+        events: list[ProposedEvent[ProductionEvent]] = [
+            ProposedEvent(
+                f"proposed:r{revision}",
+                ArtifactVersionProposedEvt(
+                    series_id=command.series_id,
+                    revision=revision,
+                    artifact_ref=ref,
+                    candidate_id=command.candidate_id,
+                    produced_by_attempt=command.produced_by_attempt,
+                    output_key=command.output_key,
+                    partition_key=command.partition_key,
+                ),
+            )
+        ]
+        if command.acceptance_mode is AcceptanceMode.AUTO:
+            events.append(
+                ProposedEvent(
+                    f"accepted:r{revision}",
+                    ArtifactVersionAcceptedEvt(
+                        series_id=command.series_id,
+                        revision=revision,
+                        artifact_ref=ref,
+                        previous_current_ref=state.current_ref,
+                        candidate_id=command.candidate_id,
+                        produced_by_attempt=command.produced_by_attempt,
+                        output_key=command.output_key,
+                        partition_key=command.partition_key,
+                    ),
+                )
+            )
+        return Accepted(tuple(events))
+
+    def _mark_stale(
+        self, state: SeriesState, command: MarkArtifactStaleCmd
+    ) -> Accepted[ProductionEvent] | Rejected:
+        reason = (
+            command.target_ref.artifact_id,
+            command.invalidated_input_ref.artifact_id,
+            command.replacement_ref.artifact_id,
+        )
+        if reason in state.stale_reasons:
+            return Accepted(())  # 原因级幂等
+        return Accepted(
+            (
+                ProposedEvent(
+                    f"stale:{reason[0]}:{reason[1]}",
+                    ArtifactMarkedStaleEvt(
+                        target_ref=command.target_ref,
+                        invalidated_input_ref=command.invalidated_input_ref,
+                        replacement_ref=command.replacement_ref,
+                        root_cause_event_id=command.root_cause_event_id,
+                        scope=command.scope,
+                        task_key=command.task_key,
+                        partition_key=command.partition_key,
+                    ),
+                ),
+            )
+        )
+
+    def evolve(self, state: SeriesState, event: ProductionEvent) -> SeriesState:
+        if isinstance(event, ArtifactVersionProposedEvt):
+            return state.model_copy(
+                update={
+                    "max_revision": event.revision,
+                    "candidates": (*state.candidates, event.candidate_id),
+                }
+            )
+        if isinstance(event, ArtifactVersionAcceptedEvt):
+            return state.model_copy(update={"current_ref": event.artifact_ref})
+        if isinstance(event, ArtifactMarkedStaleEvt):
+            reason = (
+                event.target_ref.artifact_id,
+                event.invalidated_input_ref.artifact_id,
+                event.replacement_ref.artifact_id,
+            )
+            return state.model_copy(
+                update={"stale_reasons": (*state.stale_reasons, reason)}
+            )
+        return state

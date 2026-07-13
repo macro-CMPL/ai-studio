@@ -31,7 +31,11 @@
       稳定 event_key 派生确定性 event_id;事务性写缓冲 UoW(校验-全部→应用-全部,
       真实乐观并发 + 幂等冲突检测);ProcessedCommand 结果去重;三阶段独立 Tick
       (Command Worker / Event Pump / Outbox Relay)+ 公平 Driver;崩溃恢复接缝。
-- [ ] M3 Artifact Lineage 与动态 Stage 展开
+- [x] **M3 Artifact Lineage 与动态 Stage 展开** — 三类流(Project/TaskAttempt/ArtifactSeries)
+      + 四个 PM(Expansion/Publish/Lineage/Recompute);ArtifactVersion 剥离状态(状态改由
+      事件+投影);SeriesDecider 单调分配 revision;LineagePM 维护消费边 → 显式 ArtifactMarkedStale
+      事实 → RecomputePM 选择性重算;两步展开 + partition 级序列 + 稳定 attempt_id 幂等。
+      Golden:剧本→分镜(2 shot)→动态展开→出图→取代 shot_02 上游→仅 shot_02 失效重算,shot_01 不动。
 - [ ] M4 幂等 Provider 与 BudgetLedger
 - [ ] M5 完整 QC 回流 Golden Scenario(P0A 垂直切片)
 

@@ -155,3 +155,18 @@ class BudgetState(StrEnum):
     BLOCKED_BUDGET = "blocked_budget"
     OVER_BUDGET = "over_budget"
 
+
+class PropagationMode(StrEnum):
+    """失效传播范围,在绑定时编译进 lineage edge(不在运行时靠 cardinality 推测)。"""
+
+    PARTITION_PRESERVING = "partition_preserving"
+    AGGREGATE = "aggregate"
+    GLOBAL = "global"
+
+
+class AcceptanceMode(StrEnum):
+    """产物接受模式。M3 固定 AUTO;M5 对需 QC 的 Stage 用 GATED。"""
+
+    AUTO = "auto"
+    GATED = "gated"
+

@@ -1,4 +1,4 @@
-"""Milestone 1 验收:领域对象契约、不变式、深度不可变与确定性。
+﻿"""Milestone 1 验收:领域对象契约、不变式、深度不可变与确定性。
 
 含攻击性反例:验证不变式被代码真正封住,而非可被伪造。
 """
@@ -13,9 +13,9 @@ from pydantic import TypeAdapter, ValidationError
 
 from studio.domain import ids
 from studio.domain.artifacts import (
-    Artifact,
     ArtifactPayload,
     ArtifactRef,
+    ArtifactVersion,
     ImagePayload,
     OperationParam,
     PlannedOperation,
@@ -28,8 +28,6 @@ from studio.domain.enums import (
     CardinalityKind,
     ControlRole,
     CostMode,
-    CurrencyStatus,
-    DependencyStatus,
     ExecutorKind,
     LedgerEntryType,
     LedgerSubjectType,
@@ -71,9 +69,6 @@ def _valid_artifact_kwargs() -> dict[str, object]:
         "digest": digest(payload),
         "produced_by_attempt": "att-1",
         "supersedes_id": None,
-        "acceptance": AcceptanceStatus.PROPOSED,
-        "currency": CurrencyStatus.CURRENT,
-        "dependency": DependencyStatus.FRESH,
         "created_at": _TS,
         "payload": payload,
     }
@@ -95,7 +90,7 @@ def test_payload_discriminated_union_round_trips() -> None:
 
 def test_artifact_factory_produces_valid_and_ref() -> None:
     series = ids.series_id("proj_1", "storyboard_frame", "shot_02")
-    art = Artifact.create(
+    art = ArtifactVersion.create(
         series_id=series,
         revision=1,
         logical_slot="storyboard_frame",
@@ -119,35 +114,35 @@ def test_artifact_rejects_type_payload_mismatch() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["type"] = ArtifactType.SCRIPT  # 与 image payload 不符
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_artifact_rejects_wrong_digest() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["digest"] = "wrong"
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_artifact_rejects_wrong_deterministic_id() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["artifact_id"] = "forged"
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_artifact_requires_positive_revision() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["revision"] = -1
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_artifact_requires_aware_datetime() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["created_at"] = _NAIVE
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_revision_requires_supersedes_id() -> None:
@@ -161,17 +156,17 @@ def test_revision_requires_supersedes_id() -> None:
         digest=digest(payload),
     )
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
 def test_revision_one_rejects_supersedes_id() -> None:
     kwargs = _valid_artifact_kwargs()
     kwargs["supersedes_id"] = "anything"  # revision==1 不得有
     with pytest.raises(ValidationError):
-        Artifact(**kwargs)
+        ArtifactVersion(**kwargs)
 
 
-def test_revision_requires_exact_previous_artifact() -> None:
+def test_revision_requires_exact_previous_ArtifactVersion() -> None:
     series = ids.series_id("proj_1", "storyboard_frame", "shot_02")
     payload = _image_payload()
     kwargs = _valid_artifact_kwargs()
@@ -185,10 +180,10 @@ def test_revision_requires_exact_previous_artifact() -> None:
     # 指向错误的上一版本 -> 拒绝
     bad = {**kwargs, "supersedes_id": "wrong"}
     with pytest.raises(ValidationError):
-        Artifact(**bad)
+        ArtifactVersion(**bad)
     # 精确指向 revision 1 -> 接受
     good = {**kwargs, "supersedes_id": ids.artifact_id(series, 1)}
-    art = Artifact(**good)
+    art = ArtifactVersion(**good)
     assert art.supersedes_id == ids.artifact_id(series, 1)
 
 
@@ -460,3 +455,4 @@ def test_ledger_entry_rejects_bad_fields(field: str, value: object) -> None:
     base[field] = value
     with pytest.raises(ValidationError):
         LedgerEntry(**base)
+

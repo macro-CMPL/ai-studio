@@ -25,13 +25,7 @@ from studio.serialization import digest as compute_digest
 
 from . import ids
 from ._base import FrozenModel, Sha256Hex, UtcDatetime
-from .enums import (
-    AcceptanceStatus,
-    ArtifactType,
-    CurrencyStatus,
-    DependencyStatus,
-    Severity,
-)
+from .enums import ArtifactType, Severity
 
 
 class ArtifactRef(FrozenModel):
@@ -155,7 +149,10 @@ ArtifactPayload = Annotated[
 # --------------------------------------------------------------------------- #
 
 
-class Artifact(FrozenModel):
+class ArtifactVersion(FrozenModel):
+    """不可变的内容寻址产物版本。生命周期状态(acceptance/currency/dependency)
+    不在此建模,而是由事件 + 投影(ArtifactLifecycleView)得到。"""
+
     artifact_id: str
     series_id: str
     revision: PositiveInt
@@ -165,14 +162,11 @@ class Artifact(FrozenModel):
     digest: Sha256Hex
     produced_by_attempt: str | None
     supersedes_id: str | None
-    acceptance: AcceptanceStatus
-    currency: CurrencyStatus
-    dependency: DependencyStatus
     created_at: UtcDatetime
     payload: ArtifactPayload
 
     @model_validator(mode="after")
-    def _enforce_invariants(self) -> Artifact:
+    def _enforce_invariants(self) -> ArtifactVersion:
         expected_id = ids.artifact_id(self.series_id, self.revision)
         if self.artifact_id != expected_id:
             raise ValueError(
@@ -217,10 +211,7 @@ class Artifact(FrozenModel):
         payload: ArtifactPayload,
         produced_by_attempt: str | None,
         created_at: datetime,
-        acceptance: AcceptanceStatus = AcceptanceStatus.PROPOSED,
-        currency: CurrencyStatus = CurrencyStatus.CURRENT,
-        dependency: DependencyStatus = DependencyStatus.FRESH,
-    ) -> Artifact:
+    ) -> ArtifactVersion:
         """唯一推荐的构造入口:派生字段(artifact_id/type/digest/supersedes_id)由此计算。"""
         supersedes_id = (
             None if revision == 1 else ids.artifact_id(series_id, revision - 1)
@@ -235,9 +226,6 @@ class Artifact(FrozenModel):
             digest=compute_digest(payload),
             produced_by_attempt=produced_by_attempt,
             supersedes_id=supersedes_id,
-            acceptance=acceptance,
-            currency=currency,
-            dependency=dependency,
             created_at=created_at,
             payload=payload,
         )
