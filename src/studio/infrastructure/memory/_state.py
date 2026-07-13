@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,7 +47,8 @@ class Buffers:
 
 
 class MemoryDatabase:
-    """已提交状态的持有者。"""
+    """已提交状态的持有者。commit 在 lock 内完成"读取当前态→校验→应用→换入"。"""
 
     def __init__(self) -> None:
         self.state = DbState()
+        self.lock = threading.RLock()
