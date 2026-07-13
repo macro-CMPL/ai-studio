@@ -22,13 +22,28 @@ class ControlRole(StrEnum):
     GATE = "gate"
 
 
-class SideEffectLevel(StrEnum):
-    """副作用等级。P0A 中 Agent 只允许 PURE / READ_ONLY。"""
+class ToolEffectLevel(StrEnum):
+    """Stage 执行器**允许调用的工具**的副作用等级。
+
+    注意:它描述的是可调用工具的副作用,不描述 Model executor 自身的费用
+    (后者由 CostMode 表达)。P0A 中 Agent 只允许 PURE / READ_ONLY 工具。
+    """
 
     PURE = "pure"
     READ_ONLY = "read_only"
     COSTED = "costed"
     MUTATING = "mutating"
+
+
+class CostMode(StrEnum):
+    """Stage 执行器**自身**是否产生费用(与工具副作用正交)。
+
+    - FREE:如 mock 模型、纯本地 Transform
+    - METERED:如真实 LLM(Token 计费)、付费 Provider
+    """
+
+    FREE = "free"
+    METERED = "metered"
 
 
 class ArtifactType(StrEnum):

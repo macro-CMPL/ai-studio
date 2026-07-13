@@ -1,5 +1,9 @@
 # AI 制片工作室 · 工作流内核
 
+[![CI](https://github.com/macro-CMPL/ai-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/macro-CMPL/ai-studio/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+
 一个 AI 视频制片流水线的**事件溯源工作流内核**。表面是像素工作室,内核是一条可重放、
 可崩溃恢复、带精确产物血缘与预算账本的多阶段生产线。
 

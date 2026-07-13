@@ -7,23 +7,22 @@ partition 是否兼容、fan-in/fan-out 是否明确、schema 版本是否兼容
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import PositiveInt, field_serializer, model_validator
 
+from ._base import FrozenModel
 from .enums import (
+    AcceptanceStatus,
     ArtifactType,
     CardinalityKind,
     ControlRole,
+    CostMode,
     ExecutorKind,
     PartitioningKind,
-    SideEffectLevel,
+    ToolEffectLevel,
 )
 
 
-class _Frozen(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class Partitioning(_Frozen):
+class Partitioning(FrozenModel):
     kind: PartitioningKind
     from_key: str | None = None
 
@@ -36,7 +35,7 @@ class Partitioning(_Frozen):
         return self
 
 
-class Cardinality(_Frozen):
+class Cardinality(FrozenModel):
     kind: CardinalityKind
     partition_by: str | None = None
 
@@ -50,44 +49,59 @@ class Cardinality(_Frozen):
         return self
 
 
-class Requirement(_Frozen):
+class Requirement(FrozenModel):
     """一个 Stage 对上游产物的输入依赖声明。"""
 
     artifact_type: ArtifactType
     logical_slot: str
     partition_selector: str | None = None
-    acceptance_filter: str = "accepted"
+    acceptance_filter: AcceptanceStatus = AcceptanceStatus.ACCEPTED
     cardinality: Cardinality
 
 
-class OutputSpec(_Frozen):
+class OutputSpec(FrozenModel):
     """一个 Stage 的产出声明。"""
 
     artifact_type: ArtifactType
     logical_slot: str
-    schema_version: int
+    schema_version: PositiveInt
     partitioning: Partitioning
 
 
-class StageSpec(_Frozen):
-    """流水线中的一个工位模板。executor_kind 与 control_role 正交。"""
+class StageSpec(FrozenModel):
+    """流水线中的一个工位模板。
+
+    两个正交维度:
+    - executor_kind × control_role
+    - allowed_tool_effects(可调用工具的副作用) 与 cost_mode(执行器自身是否计费)
+    """
 
     stage_id: str
     executor_kind: ExecutorKind
     control_role: ControlRole
-    side_effect_level: SideEffectLevel
+    allowed_tool_effects: frozenset[ToolEffectLevel]
+    cost_mode: CostMode
     requires: tuple[Requirement, ...]
     produces: tuple[OutputSpec, ...]
 
+    @field_serializer("allowed_tool_effects")
+    def _ser_effects(self, effects: frozenset[ToolEffectLevel]) -> list[str]:
+        # frozenset 迭代顺序不稳定;canonical 输出前排序以保证确定性。
+        return sorted(e.value for e in effects)
+
     @model_validator(mode="after")
-    def _check_agent_side_effects(self) -> StageSpec:
-        # P0A 约束:Agent 只能是 PURE / READ_ONLY,付费副作用外置到 Provider。
-        if self.executor_kind is ExecutorKind.AGENT and self.side_effect_level in (
-            SideEffectLevel.COSTED,
-            SideEffectLevel.MUTATING,
-        ):
-            raise ValueError(
-                f"P0A 禁止 Agent stage '{self.stage_id}' 携带 "
-                f"{self.side_effect_level.value} 副作用;付费/写副作用应外置为 Provider stage"
-            )
+    def _check_agent_tool_effects(self) -> StageSpec:
+        # P0A 约束:Agent 只能调用 PURE / READ_ONLY 工具,付费/写副作用外置为 Provider。
+        # 注意:Agent 的 Model 调用费用由 cost_mode(METERED) 表达,不属于工具副作用。
+        if self.executor_kind is ExecutorKind.AGENT:
+            forbidden = self.allowed_tool_effects - {
+                ToolEffectLevel.PURE,
+                ToolEffectLevel.READ_ONLY,
+            }
+            if forbidden:
+                names = ", ".join(sorted(e.value for e in forbidden))
+                raise ValueError(
+                    f"P0A 禁止 Agent stage '{self.stage_id}' 调用带副作用的工具:{names};"
+                    f"付费/写副作用应外置为 Provider stage"
+                )
         return self
