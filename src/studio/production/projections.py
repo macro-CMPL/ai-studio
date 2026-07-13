@@ -54,14 +54,21 @@ class ArtifactLifecycleView:
         entry = self._current.get(series_id)
         return entry[1] if entry is not None else None
 
+    def is_known(self, artifact_id: str) -> bool:
+        return artifact_id in self._series_of
+
+    def _require_known(self, artifact_id: str) -> None:
+        if artifact_id not in self._series_of:
+            raise LookupError(f"未知 artifact:{artifact_id}")
+
     def acceptance(self, artifact_id: str) -> AcceptanceStatus:
+        self._require_known(artifact_id)
         if artifact_id in self._accepted:
             return AcceptanceStatus.ACCEPTED
-        if artifact_id in self._proposed:
-            return AcceptanceStatus.PROPOSED
         return AcceptanceStatus.PROPOSED
 
     def currency(self, artifact_id: str) -> CurrencyStatus:
+        self._require_known(artifact_id)
         series = self._series_of.get(artifact_id)
         if series is not None:
             current = self._current.get(series)
@@ -70,6 +77,7 @@ class ArtifactLifecycleView:
         return CurrencyStatus.SUPERSEDED
 
     def dependency(self, artifact_id: str) -> DependencyStatus:
+        self._require_known(artifact_id)
         return (
             DependencyStatus.STALE
             if artifact_id in self._stale

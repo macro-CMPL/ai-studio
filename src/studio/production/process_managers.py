@@ -8,9 +8,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from studio.domain import ids as domain_ids
 from studio.domain.artifacts import ArtifactRef, StoryboardPayload
-from studio.domain.enums import AcceptanceMode, PropagationMode
+from studio.domain.enums import AcceptanceMode
 from studio.kernel.envelopes import EventEnvelope
 from studio.kernel.process_manager import ProposedCommand, Reaction
 
@@ -30,15 +29,42 @@ from .payloads import (
     TaskAttemptCreatedEvt,
     TaskInputsBoundEvt,
 )
+from .pipeline import PipelineSpec, StageDef, StageMode
 from .values import BindingItem
-
-_STORYBOARD = "storyboard"
-_PLAN = "plan"
-_IMAGE = "image"
 
 
 def _frozen() -> ConfigDict:
     return ConfigDict(frozen=True)
+
+
+def _partitions_of(payload: object) -> tuple[str, ...]:
+    if isinstance(payload, StoryboardPayload):
+        return tuple(sorted(s.shot_id for s in payload.shots))
+    return ()
+
+
+def _create_attempt(
+    *,
+    project_id: str,
+    stage: StageDef,
+    partition_key: str | None,
+    bindings: tuple[BindingItem, ...],
+) -> tuple[str, CreateTaskAttemptCmd]:
+    from studio.domain import ids as domain_ids
+
+    tk = identity.task_key(project_id, stage.stage_id, partition_key)
+    aid = identity.attempt_id(tk, identity.input_binding_digest(bindings), 0)
+    series = domain_ids.series_id(project_id, stage.output_key, partition_key)
+    cmd = CreateTaskAttemptCmd(
+        attempt_id=aid,
+        project_id=project_id,
+        stage_id=stage.stage_id,
+        partition_key=partition_key,
+        output_key=stage.output_key,
+        series_id=series,
+        exact_refs=bindings,
+    )
+    return aid, cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +90,7 @@ class PublishProcessManager:
         if not isinstance(payload, ArtifactCandidateProducedEvt):
             return Reaction(state=state, commands=())
         cmd = ProposeArtifactVersionCmd(
+            project_id=payload.project_id,
             series_id=payload.series_id,
             candidate_id=payload.candidate_id,
             output_key=payload.output_key,
@@ -87,7 +114,7 @@ class PublishProcessManager:
 
 
 # --------------------------------------------------------------------------- #
-# ExpansionPM:实例图从无到有(bootstrap + fan-out + 1:1 展开)
+# ExpansionPM:按注入的 PipelineSpec 展开;状态按 project 隔离
 # --------------------------------------------------------------------------- #
 
 
@@ -98,44 +125,39 @@ class AcceptedRefEntry(BaseModel):
     ref: ArtifactRef
 
 
-class ExpansionState(BaseModel):
+class ProjectExpansion(BaseModel):
     model_config = _frozen()
-    project_id: str | None = None
-    shots: tuple[str, ...] = ()
+    project_id: str
+    partitions_by_output: tuple[tuple[str, tuple[str, ...]], ...] = ()
     accepted: tuple[AcceptedRefEntry, ...] = ()
 
-    def find_ref(self, output_key: str, partition_key: str | None) -> ArtifactRef | None:
-        for e in self.accepted:
-            if e.output_key == output_key and e.partition_key == partition_key:
-                return e.ref
-        return None
+    def partitions(self, output_key: str) -> tuple[str, ...]:
+        return next(
+            (parts for (ok, parts) in self.partitions_by_output if ok == output_key),
+            (),
+        )
 
 
-def _create_attempt_cmd(
-    *,
-    project_id: str,
-    stage_id: str,
-    partition_key: str | None,
-    output_key: str,
-    bindings: tuple[BindingItem, ...],
-) -> tuple[str, CreateTaskAttemptCmd]:
-    tk = identity.task_key(project_id, stage_id, partition_key)
-    aid = identity.attempt_id(tk, identity.input_binding_digest(bindings), 0)
-    series = domain_ids.series_id(project_id, output_key, partition_key)
-    cmd = CreateTaskAttemptCmd(
-        attempt_id=aid,
-        project_id=project_id,
-        stage_id=stage_id,
-        partition_key=partition_key,
-        output_key=output_key,
-        series_id=series,
-        exact_refs=bindings,
-    )
-    return aid, cmd
+class ExpansionState(BaseModel):
+    model_config = _frozen()
+    projects: tuple[ProjectExpansion, ...] = ()
+
+    def project(self, project_id: str) -> ProjectExpansion:
+        return next(
+            (p for p in self.projects if p.project_id == project_id),
+            ProjectExpansion(project_id=project_id),
+        )
+
+    def with_project(self, updated: ProjectExpansion) -> ExpansionState:
+        others = tuple(p for p in self.projects if p.project_id != updated.project_id)
+        return self.model_copy(update={"projects": (*others, updated)})
 
 
 class ExpansionProcessManager:
     pm_id = "expansion-pm"
+
+    def __init__(self, spec: PipelineSpec) -> None:
+        self._spec = spec
 
     def initial_state(self) -> ExpansionState:
         return ExpansionState()
@@ -147,7 +169,7 @@ class ExpansionProcessManager:
         if isinstance(payload, PipelineInitializedEvt):
             return self._bootstrap(state, payload)
         if isinstance(payload, ArtifactCandidateProducedEvt):
-            return self._cache_shots(state, payload)
+            return self._cache_partitions(state, payload)
         if isinstance(payload, ArtifactVersionAcceptedEvt):
             return self._on_accepted(state, payload)
         if isinstance(payload, StageExpandedEvt):
@@ -157,121 +179,132 @@ class ExpansionProcessManager:
     def _bootstrap(
         self, state: ExpansionState, payload: PipelineInitializedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
-        _, cmd = _create_attempt_cmd(
-            project_id=payload.project_id,
-            stage_id=_STORYBOARD,
-            partition_key=None,
-            output_key=_STORYBOARD,
-            bindings=(),
-        )
-        return Reaction(
-            state=state.model_copy(update={"project_id": payload.project_id}),
-            commands=(
+        if payload.pipeline_spec_id != self._spec.spec_id:
+            return Reaction(state=state, commands=())  # 非本 spec 管辖
+        commands: list[ProposedCommand[ProductionCommand]] = []
+        for stage in self._spec.root_stages():
+            aid, cmd = _create_attempt(
+                project_id=payload.project_id,
+                stage=stage,
+                partition_key=None,
+                bindings=(),
+            )
+            commands.append(
                 ProposedCommand(
-                    reaction_name="bootstrap-storyboard",
-                    command_key=f"create:{cmd.attempt_id}",
-                    target=identity.attempt_stream(cmd.attempt_id),
+                    reaction_name=f"bootstrap:{stage.stage_id}",
+                    command_key=f"create:{aid}",
+                    target=identity.attempt_stream(aid),
                     payload=cmd,
-                ),
-            ),
-        )
+                )
+            )
+        new_project = state.project(payload.project_id)
+        return Reaction(state=state.with_project(new_project), commands=tuple(commands))
 
-    def _cache_shots(
+    def _cache_partitions(
         self, state: ExpansionState, payload: ArtifactCandidateProducedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
-        if payload.output_key == _STORYBOARD and isinstance(
-            payload.payload, StoryboardPayload
-        ):
-            shots = tuple(sorted(s.shot_id for s in payload.payload.shots))
-            return Reaction(state=state.model_copy(update={"shots": shots}), commands=())
-        return Reaction(state=state, commands=())
+        parts = _partitions_of(payload.payload)
+        if not parts:
+            return Reaction(state=state, commands=())
+        proj = state.project(payload.project_id)
+        others = tuple(
+            e for e in proj.partitions_by_output if e[0] != payload.output_key
+        )
+        updated = proj.model_copy(
+            update={"partitions_by_output": (*others, (payload.output_key, parts))}
+        )
+        return Reaction(state=state.with_project(updated), commands=())
 
     def _on_accepted(
         self, state: ExpansionState, payload: ArtifactVersionAcceptedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
+        proj = state.project(payload.project_id)
         entry = AcceptedRefEntry(
             output_key=payload.output_key,
             partition_key=payload.partition_key,
             ref=payload.artifact_ref,
         )
-        new_state = state.model_copy(update={"accepted": (*state.accepted, entry)})
-        project = new_state.project_id
-        if project is None:
-            return Reaction(state=new_state, commands=())
+        proj = proj.model_copy(update={"accepted": (*proj.accepted, entry)})
+        new_state = state.with_project(proj)
+        commands: list[ProposedCommand[ProductionCommand]] = []
 
-        if payload.output_key == _STORYBOARD:
-            cmd = ExpandStageCmd(
-                project_id=project,
-                stage_id=_PLAN,
-                driver_ref=payload.artifact_ref,
-                partitions=new_state.shots,
+        # FANOUT:本产物是某扇出阶段的 driver
+        for stage in self._spec.fanout_driven_by(payload.output_key):
+            partitions = tuple(sorted(set(proj.partitions(payload.output_key))))
+            task_keys = tuple(
+                sorted(
+                    identity.task_key(payload.project_id, stage.stage_id, p)
+                    for p in partitions
+                )
             )
-            return Reaction(
-                state=new_state,
-                commands=(
-                    ProposedCommand(
-                        reaction_name="expand-plan",
-                        command_key="expand:plan",
-                        target=identity.project_stream(project),
-                        payload=cmd,
+            commands.append(
+                ProposedCommand(
+                    reaction_name=f"expand:{stage.stage_id}",
+                    command_key=f"expand:{stage.stage_id}:{payload.artifact_ref.artifact_id}",
+                    target=identity.project_stream(payload.project_id),
+                    payload=ExpandStageCmd(
+                        project_id=payload.project_id,
+                        stage_id=stage.stage_id,
+                        driver_ref=payload.artifact_ref,
+                        partitions=partitions,
+                        task_keys=task_keys,
                     ),
-                ),
+                )
             )
-        if payload.output_key == _PLAN and payload.partition_key is not None:
+
+        # PER_PARTITION:本产物直接喂下游 1:1 阶段
+        for stage in self._spec.per_partition_fed_by(payload.output_key):
+            assert stage.requirement_key is not None
+            assert stage.propagation_mode is not None
             binding = BindingItem.from_ref(
-                requirement_key=_PLAN,
-                logical_slot=_PLAN,
+                requirement_key=stage.requirement_key,
+                logical_slot=stage.requirement_key,
                 partition_key=payload.partition_key,
                 ref=payload.artifact_ref,
-                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+                propagation_mode=stage.propagation_mode,
             )
-            aid, cmd2 = _create_attempt_cmd(
-                project_id=project,
-                stage_id=_IMAGE,
+            aid, cmd = _create_attempt(
+                project_id=payload.project_id,
+                stage=stage,
                 partition_key=payload.partition_key,
-                output_key=_IMAGE,
-                bindings=(binding,),
-            )
-            return Reaction(
-                state=new_state,
-                commands=(
-                    ProposedCommand(
-                        reaction_name="create-image",
-                        command_key=f"create:{aid}",
-                        target=identity.attempt_stream(aid),
-                        payload=cmd2,
-                    ),
-                ),
-            )
-        return Reaction(state=new_state, commands=())
-
-    def _on_stage_expanded(
-        self, state: ExpansionState, payload: StageExpandedEvt
-    ) -> Reaction[ExpansionState, ProductionCommand]:
-        if payload.stage_id != _PLAN or state.project_id is None:
-            return Reaction(state=state, commands=())
-        storyboard_ref = state.find_ref(_STORYBOARD, None)
-        if storyboard_ref is None:
-            return Reaction(state=state, commands=())
-        commands: list[ProposedCommand[ProductionCommand]] = []
-        for partition in payload.partitions:
-            binding = BindingItem.from_ref(
-                requirement_key=_STORYBOARD,
-                logical_slot=_STORYBOARD,
-                partition_key=partition,
-                ref=storyboard_ref,
-                propagation_mode=PropagationMode.AGGREGATE,
-            )
-            aid, cmd = _create_attempt_cmd(
-                project_id=state.project_id,
-                stage_id=_PLAN,
-                partition_key=partition,
-                output_key=_PLAN,
                 bindings=(binding,),
             )
             commands.append(
                 ProposedCommand(
-                    reaction_name="create-plan",
+                    reaction_name=f"create:{stage.stage_id}",
+                    command_key=f"create:{aid}",
+                    target=identity.attempt_stream(aid),
+                    payload=cmd,
+                )
+            )
+        return Reaction(state=new_state, commands=tuple(commands))
+
+    def _on_stage_expanded(
+        self, state: ExpansionState, payload: StageExpandedEvt
+    ) -> Reaction[ExpansionState, ProductionCommand]:
+        stage = self._spec.by_stage(payload.stage_id)
+        if stage is None or stage.mode is not StageMode.FANOUT:
+            return Reaction(state=state, commands=())
+        assert stage.requirement_key is not None
+        assert stage.propagation_mode is not None
+        commands: list[ProposedCommand[ProductionCommand]] = []
+        for partition in payload.partitions:
+            binding = BindingItem.from_ref(
+                requirement_key=stage.requirement_key,
+                logical_slot=stage.requirement_key,
+                partition_key=partition,
+                ref=payload.driver_ref,  # 用事件中的 driver_ref,绑定正确版本
+                propagation_mode=stage.propagation_mode,
+            )
+            aid, cmd = _create_attempt(
+                project_id=payload.project_id,
+                stage=stage,
+                partition_key=partition,
+                bindings=(binding,),
+            )
+            commands.append(
+                ProposedCommand(
+                    reaction_name=f"create:{stage.stage_id}:{partition}",
                     command_key=f"create:{aid}",
                     target=identity.attempt_stream(aid),
                     payload=cmd,
@@ -281,7 +314,7 @@ class ExpansionProcessManager:
 
 
 # --------------------------------------------------------------------------- #
-# LineagePM:维护消费边,检测版本替换,确定性发 MarkArtifactStale
+# LineagePM:维护消费边 + 各 series 当前版本,双向检测失效
 # --------------------------------------------------------------------------- #
 
 
@@ -304,11 +337,18 @@ class AttemptTarget(BaseModel):
     ref: ArtifactRef
 
 
+class CurrentRef(BaseModel):
+    model_config = _frozen()
+    series_id: str
+    ref: ArtifactRef
+
+
 class LineageState(BaseModel):
     model_config = _frozen()
     metas: tuple[AttemptMeta, ...] = ()
     inputs: tuple[AttemptInputs, ...] = ()
     targets: tuple[AttemptTarget, ...] = ()
+    current: tuple[CurrentRef, ...] = ()
 
     def meta_of(self, attempt_id: str) -> AttemptMeta | None:
         return next((m for m in self.metas if m.attempt_id == attempt_id), None)
@@ -320,6 +360,35 @@ class LineageState(BaseModel):
     def target_of(self, attempt_id: str) -> ArtifactRef | None:
         found = next((t for t in self.targets if t.attempt_id == attempt_id), None)
         return found.ref if found is not None else None
+
+    def current_of(self, series_id: str) -> ArtifactRef | None:
+        found = next((c for c in self.current if c.series_id == series_id), None)
+        return found.ref if found is not None else None
+
+
+def _stale_cmd(
+    *,
+    target_ref: ArtifactRef,
+    invalidated: ArtifactRef,
+    replacement: ArtifactRef,
+    root_cause_event_id: str,
+    binding: BindingItem,
+    meta: AttemptMeta,
+) -> ProposedCommand[ProductionCommand]:
+    return ProposedCommand(
+        reaction_name="mark-stale",
+        command_key=f"{target_ref.artifact_id}:{invalidated.artifact_id}",
+        target=identity.series_stream(target_ref.series_id),
+        payload=MarkArtifactStaleCmd(
+            target_ref=target_ref,
+            invalidated_input_ref=invalidated,
+            replacement_ref=replacement,
+            root_cause_event_id=root_cause_event_id,
+            scope=binding.propagation_mode,
+            task_key=meta.task_key,
+            partition_key=meta.partition_key,
+        ),
+    )
 
 
 class LineageProcessManager:
@@ -365,51 +434,67 @@ class LineageProcessManager:
         target_entry = AttemptTarget(
             attempt_id=payload.produced_by_attempt, ref=payload.artifact_ref
         )
+        others = tuple(c for c in state.current if c.series_id != payload.series_id)
         new_state = state.model_copy(
-            update={"targets": (*state.targets, target_entry)}
-        )
-        if payload.previous_current_ref is None:
-            return Reaction(state=new_state, commands=())
-
-        invalidated = payload.previous_current_ref
-        commands: list[ProposedCommand[ProductionCommand]] = []
-        for inputs in new_state.inputs:
-            binding = next(
-                (
-                    b
-                    for b in inputs.bindings
-                    if b.artifact_id == invalidated.artifact_id
+            update={
+                "targets": (*state.targets, target_entry),
+                "current": (
+                    *others,
+                    CurrentRef(series_id=payload.series_id, ref=payload.artifact_ref),
                 ),
-                None,
-            )
-            if binding is None:
-                continue
-            target_ref = new_state.target_of(inputs.attempt_id)
-            meta = new_state.meta_of(inputs.attempt_id)
-            if target_ref is None or meta is None:
-                continue
-            cmd = MarkArtifactStaleCmd(
-                target_ref=target_ref,
-                invalidated_input_ref=invalidated,
-                replacement_ref=payload.artifact_ref,
-                root_cause_event_id=event.event_id,
-                scope=binding.propagation_mode,
-                task_key=meta.task_key,
-                partition_key=meta.partition_key,
-            )
-            commands.append(
-                ProposedCommand(
-                    reaction_name="mark-stale",
-                    command_key=f"{target_ref.artifact_id}:{invalidated.artifact_id}",
-                    target=identity.series_stream(target_ref.series_id),
-                    payload=cmd,
+            }
+        )
+        commands: list[ProposedCommand[ProductionCommand]] = []
+
+        # (a) 上游替换:标记已完成的旧版本消费者
+        if payload.previous_current_ref is not None:
+            invalidated = payload.previous_current_ref
+            for inputs in new_state.inputs:
+                binding = _binding_for(inputs.bindings, invalidated.artifact_id)
+                if binding is None:
+                    continue
+                target_ref = new_state.target_of(inputs.attempt_id)
+                meta = new_state.meta_of(inputs.attempt_id)
+                if target_ref is None or meta is None:
+                    continue
+                commands.append(
+                    _stale_cmd(
+                        target_ref=target_ref,
+                        invalidated=invalidated,
+                        replacement=payload.artifact_ref,
+                        root_cause_event_id=event.event_id,
+                        binding=binding,
+                        meta=meta,
+                    )
                 )
-            )
+
+        # (b) 下游晚完成:本产物绑定的某上游已非 current
+        meta = new_state.meta_of(payload.produced_by_attempt)
+        if meta is not None:
+            for binding in new_state.inputs_of(payload.produced_by_attempt):
+                current = new_state.current_of(binding.series_id)
+                if current is not None and current.artifact_id != binding.artifact_id:
+                    commands.append(
+                        _stale_cmd(
+                            target_ref=payload.artifact_ref,
+                            invalidated=binding.to_ref(),
+                            replacement=current,
+                            root_cause_event_id=event.event_id,
+                            binding=binding,
+                            meta=meta,
+                        )
+                    )
         return Reaction(state=new_state, commands=tuple(commands))
 
 
+def _binding_for(
+    bindings: tuple[BindingItem, ...], artifact_id: str
+) -> BindingItem | None:
+    return next((b for b in bindings if b.artifact_id == artifact_id), None)
+
+
 # --------------------------------------------------------------------------- #
-# RecomputePM:消费 stale 事实,决定创建新 Attempt(新绑定 -> 新 attempt_id)
+# RecomputePM:消费 stale 事实,累计多输入替换,基于累计绑定算新 attempt_id
 # --------------------------------------------------------------------------- #
 
 
@@ -423,11 +508,18 @@ class RecomputeMeta(BaseModel):
     series_id: str
 
 
+class DesiredBindings(BaseModel):
+    model_config = _frozen()
+    target_artifact_id: str
+    bindings: tuple[BindingItem, ...]
+
+
 class RecomputeState(BaseModel):
     model_config = _frozen()
     metas: tuple[RecomputeMeta, ...] = ()
     inputs: tuple[AttemptInputs, ...] = ()
-    target_to_attempt: tuple[tuple[str, str], ...] = ()  # (target_artifact_id, attempt)
+    target_to_attempt: tuple[tuple[str, str], ...] = ()
+    desired: tuple[DesiredBindings, ...] = ()
 
     def meta_of(self, attempt_id: str) -> RecomputeMeta | None:
         return next((m for m in self.metas if m.attempt_id == attempt_id), None)
@@ -440,6 +532,13 @@ class RecomputeState(BaseModel):
         return next(
             (a for (t, a) in self.target_to_attempt if t == target_artifact_id), None
         )
+
+    def desired_of(self, target_artifact_id: str) -> tuple[BindingItem, ...] | None:
+        found = next(
+            (d for d in self.desired if d.target_artifact_id == target_artifact_id),
+            None,
+        )
+        return found.bindings if found is not None else None
 
 
 class RecomputeProcessManager:
@@ -488,12 +587,13 @@ class RecomputeProcessManager:
     def _on_stale(
         self, state: RecomputeState, payload: ArtifactMarkedStaleEvt
     ) -> Reaction[RecomputeState, ProductionCommand]:
-        attempt = state.attempt_for_target(payload.target_ref.artifact_id)
+        target_aid = payload.target_ref.artifact_id
+        attempt = state.attempt_for_target(target_aid)
         if attempt is None:
             return Reaction(state=state, commands=())
         meta = state.meta_of(attempt)
-        bindings = state.inputs_of(attempt)
-        if meta is None or not bindings:
+        base = state.desired_of(target_aid) or state.inputs_of(attempt)
+        if meta is None or not base:
             return Reaction(state=state, commands=())
 
         new_bindings = tuple(
@@ -506,7 +606,18 @@ class RecomputeProcessManager:
             )
             if b.artifact_id == payload.invalidated_input_ref.artifact_id
             else b
-            for b in bindings
+            for b in base
+        )
+        others = tuple(d for d in state.desired if d.target_artifact_id != target_aid)
+        new_state = state.model_copy(
+            update={
+                "desired": (
+                    *others,
+                    DesiredBindings(
+                        target_artifact_id=target_aid, bindings=new_bindings
+                    ),
+                )
+            }
         )
         tk = identity.task_key(meta.project_id, meta.stage_id, meta.partition_key)
         aid = identity.attempt_id(tk, identity.input_binding_digest(new_bindings), 0)
@@ -520,11 +631,11 @@ class RecomputeProcessManager:
             exact_refs=new_bindings,
         )
         return Reaction(
-            state=state,
+            state=new_state,
             commands=(
                 ProposedCommand(
                     reaction_name="recompute",
-                    command_key=f"recompute:{payload.target_ref.artifact_id}",
+                    command_key=f"recompute:{target_aid}:{aid}",
                     target=identity.attempt_stream(aid),
                     payload=cmd,
                 ),

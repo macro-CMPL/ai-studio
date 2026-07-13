@@ -28,11 +28,13 @@ from studio.infrastructure.memory.unit_of_work import (
 from studio.kernel.envelopes import CommandEnvelope
 from studio.production import identity
 from studio.production.attempt import TaskAttemptDecider
+from studio.production.dispatch import canonical_target
 from studio.production.payloads import (
     InitializePipelineCmd,
     ProductionCommand,
     ProposeArtifactVersionCmd,
 )
+from studio.production.pipeline import golden_pipeline
 from studio.production.process_managers import (
     ExpansionProcessManager,
     LineageProcessManager,
@@ -111,13 +113,18 @@ def build_production_stack() -> ProductionStack:
     worker = RoutingCommandWorker(
         deciders=deciders,
         resolve_kind=identity.stream_kind,
+        canonical_target=canonical_target,
         bus=bus,
         uow_factory=factory,
         clock=clock,
     )
     pumps: list[SupportsPumpTick] = [
         EventPump(process_manager=PublishProcessManager(), uow_factory=factory, clock=clock),
-        EventPump(process_manager=ExpansionProcessManager(), uow_factory=factory, clock=clock),
+        EventPump(
+            process_manager=ExpansionProcessManager(golden_pipeline()),
+            uow_factory=factory,
+            clock=clock,
+        ),
         EventPump(process_manager=LineageProcessManager(), uow_factory=factory, clock=clock),
         EventPump(process_manager=RecomputeProcessManager(), uow_factory=factory, clock=clock),
     ]
@@ -140,7 +147,7 @@ def init_command(
         causation_id=None,
         issued_at=_ISSUED_AT,
         payload=InitializePipelineCmd(
-            project_id=project_id, pipeline_spec_id="spec-v1"
+            project_id=project_id, pipeline_spec_id=golden_pipeline().spec_id
         ),
     )
 
@@ -174,6 +181,7 @@ def supersede_plan_command(
         causation_id=None,
         issued_at=_ISSUED_AT,
         payload=ProposeArtifactVersionCmd(
+            project_id=project_id,
             series_id=series,
             candidate_id=candidate_id,
             output_key="plan",

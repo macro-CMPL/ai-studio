@@ -29,6 +29,7 @@ class ExpandStageCmd(MessagePayload):
     stage_id: str
     driver_ref: ArtifactRef
     partitions: tuple[str, ...]
+    task_keys: tuple[str, ...]
 
 
 class CreateTaskAttemptCmd(MessagePayload):
@@ -44,6 +45,7 @@ class CreateTaskAttemptCmd(MessagePayload):
 
 class ProposeArtifactVersionCmd(MessagePayload):
     type: Literal["propose_artifact_version"] = "propose_artifact_version"
+    project_id: str
     series_id: str
     candidate_id: str
     output_key: str
@@ -91,6 +93,7 @@ class StageExpandedEvt(MessagePayload):
     stage_id: str
     driver_ref: ArtifactRef
     partitions: tuple[str, ...]
+    task_keys: tuple[str, ...]
 
 
 class TaskAttemptCreatedEvt(MessagePayload):
@@ -113,6 +116,7 @@ class ArtifactCandidateProducedEvt(MessagePayload):
     type: Literal["artifact_candidate_produced"] = "artifact_candidate_produced"
     candidate_id: str
     attempt_id: str
+    project_id: str
     series_id: str
     output_key: str
     partition_key: str | None
@@ -122,6 +126,7 @@ class ArtifactCandidateProducedEvt(MessagePayload):
 
 class ArtifactVersionProposedEvt(MessagePayload):
     type: Literal["artifact_version_proposed"] = "artifact_version_proposed"
+    project_id: str
     series_id: str
     revision: PositiveInt
     artifact_ref: ArtifactRef
@@ -133,6 +138,7 @@ class ArtifactVersionProposedEvt(MessagePayload):
 
 class ArtifactVersionAcceptedEvt(MessagePayload):
     type: Literal["artifact_version_accepted"] = "artifact_version_accepted"
+    project_id: str
     series_id: str
     revision: PositiveInt
     artifact_ref: ArtifactRef

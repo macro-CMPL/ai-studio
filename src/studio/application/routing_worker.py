@@ -23,6 +23,7 @@ class RoutingCommandWorker:
         *,
         deciders: Mapping[str, Any],
         resolve_kind: Callable[[str], str],
+        canonical_target: Callable[[Any], str],
         bus: CommandBus,
         uow_factory: UnitOfWorkFactory,
         clock: Clock,
@@ -30,6 +31,7 @@ class RoutingCommandWorker:
     ) -> None:
         self._deciders = deciders
         self._resolve_kind = resolve_kind
+        self._canonical_target = canonical_target
         self._bus = bus
         self._uow = uow_factory
         self._clock = clock
@@ -45,6 +47,12 @@ class RoutingCommandWorker:
         message = self._bus.peek()
         if message is None:
             return False
+
+        expected_target = self._canonical_target(message.payload)
+        if expected_target != message.target:
+            raise ContractViolation(
+                f"target 不一致:payload 归属 {expected_target},实际 {message.target}"
+            )
 
         kind = self._resolve_kind(message.target)
         decider = self._deciders[kind]

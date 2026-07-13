@@ -10,6 +10,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict
 
+from studio.domain import ids as domain_ids
 from studio.domain.artifacts import ArtifactPayload
 from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
 from studio.serialization import digest
@@ -50,6 +51,21 @@ class TaskAttemptDecider:
         if state.created:
             return Rejected("already_created", "attempt 已创建")
 
+        # 重新计算并验证确定性身份,拒绝伪造的 series_id / attempt_id。
+        expected_series = domain_ids.series_id(
+            command.project_id, command.output_key, command.partition_key
+        )
+        if command.series_id != expected_series:
+            return Rejected("forged_series", "series_id 与派生不一致")
+        tk = identity.task_key(
+            command.project_id, command.stage_id, command.partition_key
+        )
+        expected_attempt = identity.attempt_id(
+            tk, identity.input_binding_digest(command.exact_refs), 0
+        )
+        if command.attempt_id != expected_attempt:
+            return Rejected("forged_attempt", "attempt_id 与派生不一致")
+
         executor = self._executors.get(command.stage_id)
         if executor is None:
             return Rejected("no_executor", f"stage {command.stage_id} 无 executor")
@@ -80,6 +96,7 @@ class TaskAttemptDecider:
                     ArtifactCandidateProducedEvt(
                         candidate_id=candidate,
                         attempt_id=command.attempt_id,
+                        project_id=command.project_id,
                         series_id=command.series_id,
                         output_key=command.output_key,
                         partition_key=command.partition_key,

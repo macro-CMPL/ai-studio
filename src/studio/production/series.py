@@ -1,7 +1,8 @@
 """ArtifactSeriesDecider(artifact-series 流):分配 revision、接受、记录 stale 事实。
 
 - revision 由本 decider 依据 series 状态单调分配(杜绝并发 attempt 各自认领同一 revision)。
-- candidate_id 去重:同一 candidate 即使命令 ID 因异常路径改变,也不再分配第二个 revision。
+- candidate 指纹去重:同一 candidate_id 异内容 => IdempotencyConflict;同内容 => 幂等空操作。
+- 校验 digest(payload) 与命令 digest 一致。
 - stale 采用"原因级"幂等:(target, invalidated, replacement) 相同才视为重复。
 """
 
@@ -13,6 +14,8 @@ from studio.domain import ids as domain_ids
 from studio.domain.artifacts import ArtifactRef
 from studio.domain.enums import AcceptanceMode
 from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
+from studio.kernel.errors import IdempotencyConflict
+from studio.serialization import digest as compute_digest
 
 from .payloads import (
     ArtifactMarkedStaleEvt,
@@ -25,13 +28,26 @@ from .payloads import (
 )
 
 
+class CandidateRecord(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    candidate_id: str
+    digest: str
+    produced_by_attempt: str
+    output_key: str
+
+
 class SeriesState(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     max_revision: int = 0
     current_ref: ArtifactRef | None = None
-    candidates: tuple[str, ...] = ()
+    candidates: tuple[CandidateRecord, ...] = ()
     stale_reasons: tuple[tuple[str, str, str], ...] = ()
+
+    def candidate(self, candidate_id: str) -> CandidateRecord | None:
+        return next(
+            (c for c in self.candidates if c.candidate_id == candidate_id), None
+        )
 
 
 class ArtifactSeriesDecider:
@@ -50,8 +66,22 @@ class ArtifactSeriesDecider:
     def _propose(
         self, state: SeriesState, command: ProposeArtifactVersionCmd
     ) -> Accepted[ProductionEvent] | Rejected:
-        if command.candidate_id in state.candidates:
+        if compute_digest(command.payload) != command.digest:
+            return Rejected("digest_mismatch", "digest 与 payload 不一致")
+
+        prior = state.candidate(command.candidate_id)
+        if prior is not None:
+            same = (
+                prior.digest == command.digest
+                and prior.produced_by_attempt == command.produced_by_attempt
+                and prior.output_key == command.output_key
+            )
+            if not same:
+                raise IdempotencyConflict(
+                    command.candidate_id, "同 candidate_id 复用于不同内容"
+                )
             return Accepted(())  # 幂等:同一 candidate 不再分配新 revision
+
         revision = state.max_revision + 1
         ref = ArtifactRef(
             artifact_id=domain_ids.artifact_id(command.series_id, revision),
@@ -63,6 +93,7 @@ class ArtifactSeriesDecider:
             ProposedEvent(
                 f"proposed:r{revision}",
                 ArtifactVersionProposedEvt(
+                    project_id=command.project_id,
                     series_id=command.series_id,
                     revision=revision,
                     artifact_ref=ref,
@@ -78,6 +109,7 @@ class ArtifactSeriesDecider:
                 ProposedEvent(
                     f"accepted:r{revision}",
                     ArtifactVersionAcceptedEvt(
+                        project_id=command.project_id,
                         series_id=command.series_id,
                         revision=revision,
                         artifact_ref=ref,
@@ -120,10 +152,16 @@ class ArtifactSeriesDecider:
 
     def evolve(self, state: SeriesState, event: ProductionEvent) -> SeriesState:
         if isinstance(event, ArtifactVersionProposedEvt):
+            record = CandidateRecord(
+                candidate_id=event.candidate_id,
+                digest=event.artifact_ref.digest,
+                produced_by_attempt=event.produced_by_attempt,
+                output_key=event.output_key,
+            )
             return state.model_copy(
                 update={
                     "max_revision": event.revision,
-                    "candidates": (*state.candidates, event.candidate_id),
+                    "candidates": (*state.candidates, record),
                 }
             )
         if isinstance(event, ArtifactVersionAcceptedEvt):

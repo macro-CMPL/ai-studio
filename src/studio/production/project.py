@@ -45,17 +45,19 @@ class ProjectDecider:
                 )
             )
         if isinstance(command, ExpandStageCmd):
-            if command.stage_id in state.expanded:
-                return Rejected("already_expanded", f"stage {command.stage_id} 已展开")
+            key = _expansion_key(command.stage_id, command.driver_ref.artifact_id)
+            if key in state.expanded:
+                return Rejected("already_expanded", f"{key} 已展开")
             return Accepted(
                 (
                     ProposedEvent(
-                        f"stage-expanded:{command.stage_id}",
+                        f"stage-expanded:{key}",
                         StageExpandedEvt(
                             project_id=command.project_id,
                             stage_id=command.stage_id,
                             driver_ref=command.driver_ref,
                             partitions=command.partitions,
+                            task_keys=command.task_keys,
                         ),
                     ),
                 )
@@ -66,7 +68,10 @@ class ProjectDecider:
         if isinstance(event, PipelineInitializedEvt):
             return state.model_copy(update={"initialized": True})
         if isinstance(event, StageExpandedEvt):
-            return state.model_copy(
-                update={"expanded": (*state.expanded, event.stage_id)}
-            )
+            key = _expansion_key(event.stage_id, event.driver_ref.artifact_id)
+            return state.model_copy(update={"expanded": (*state.expanded, key)})
         return state
+
+
+def _expansion_key(stage_id: str, driver_artifact_id: str) -> str:
+    return f"{stage_id}:{driver_artifact_id}"
