@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import Field, PositiveInt, model_validator
@@ -23,7 +24,7 @@ from pydantic import Field, PositiveInt, model_validator
 from studio.serialization import digest as compute_digest
 
 from . import ids
-from ._base import FrozenModel, UtcDatetime
+from ._base import FrozenModel, Sha256Hex, UtcDatetime
 from .enums import (
     AcceptanceStatus,
     ArtifactType,
@@ -34,12 +35,19 @@ from .enums import (
 
 
 class ArtifactRef(FrozenModel):
-    """对某个不可变产物版本的精确引用。"""
+    """对某个不可变产物版本的精确引用。身份与摘要不可伪造。"""
 
     artifact_id: str
     series_id: str
     revision: PositiveInt
-    digest: str
+    digest: Sha256Hex
+
+    @model_validator(mode="after")
+    def _check_deterministic_id(self) -> ArtifactRef:
+        expected = ids.artifact_id(self.series_id, self.revision)
+        if self.artifact_id != expected:
+            raise ValueError("ArtifactRef.artifact_id 与 (series_id, revision) 不一致")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +162,7 @@ class Artifact(FrozenModel):
     type: ArtifactType
     logical_slot: str
     partition_key: str | None
-    digest: str
+    digest: Sha256Hex
     produced_by_attempt: str | None
     supersedes_id: str | None
     acceptance: AcceptanceStatus
@@ -177,8 +185,17 @@ class Artifact(FrozenModel):
         expected_digest = compute_digest(self.payload)
         if self.digest != expected_digest:
             raise ValueError("digest 与 payload 内容不匹配(内容寻址被破坏)")
-        if self.revision > 1 and self.supersedes_id is None:
-            raise ValueError("revision > 1 时必须提供 supersedes_id")
+        # supersedes 必须精确指向同 series 的上一版本,否则会污染 Lineage。
+        if self.revision == 1:
+            if self.supersedes_id is not None:
+                raise ValueError("revision == 1 不得设置 supersedes_id")
+        else:
+            expected_prev = ids.artifact_id(self.series_id, self.revision - 1)
+            if self.supersedes_id != expected_prev:
+                raise ValueError(
+                    "supersedes_id 必须精确指向同 series 的上一版本 "
+                    f"(revision {self.revision - 1})"
+                )
         return self
 
     def ref(self) -> ArtifactRef:
@@ -199,13 +216,15 @@ class Artifact(FrozenModel):
         partition_key: str | None,
         payload: ArtifactPayload,
         produced_by_attempt: str | None,
-        created_at: object,
-        supersedes_id: str | None = None,
+        created_at: datetime,
         acceptance: AcceptanceStatus = AcceptanceStatus.PROPOSED,
         currency: CurrencyStatus = CurrencyStatus.CURRENT,
         dependency: DependencyStatus = DependencyStatus.FRESH,
     ) -> Artifact:
-        """唯一推荐的构造入口:派生字段(artifact_id/type/digest)由此计算。"""
+        """唯一推荐的构造入口:派生字段(artifact_id/type/digest/supersedes_id)由此计算。"""
+        supersedes_id = (
+            None if revision == 1 else ids.artifact_id(series_id, revision - 1)
+        )
         return cls(
             artifact_id=ids.artifact_id(series_id, revision),
             series_id=series_id,
@@ -219,6 +238,6 @@ class Artifact(FrozenModel):
             acceptance=acceptance,
             currency=currency,
             dependency=dependency,
-            created_at=created_at,  # type: ignore[arg-type]
+            created_at=created_at,
             payload=payload,
         )

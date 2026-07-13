@@ -17,15 +17,19 @@ import uuid
 NAMESPACE = uuid.UUID("6f0c8a1e-2b3d-5e4f-9a7b-1c2d3e4f5a6b")
 
 
-def _v5(*parts: str) -> str:
-    # 结构化编码:不同的 parts 列表永远映射到不同 name,无分隔符注入歧义。
+def _v5(*parts: str | None) -> str:
+    # 结构化编码:不同的 parts 列表永远映射到不同 name,无分隔符注入歧义;
+    # None 编码为 JSON null,与空字符串 "" 严格区分。
     name = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":"))
     return str(uuid.uuid5(NAMESPACE, name))
 
 
 def series_id(project_id: str, logical_slot: str, partition_key: str | None) -> str:
-    """逻辑产物系列身份。必须包含 Project 作用域,避免跨项目系列冲突。"""
-    return _v5("series", project_id, logical_slot, partition_key or "")
+    """逻辑产物系列身份。必须包含 Project 作用域,避免跨项目系列冲突。
+
+    partition_key 为 None(singleton)与 "" 被编码为不同 name,不会碰撞。
+    """
+    return _v5("series", project_id, logical_slot, partition_key)
 
 
 def artifact_id(series_id: str, revision: int) -> str:

@@ -13,14 +13,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated
-
-from pydantic import StringConstraints
-
-from ._base import FrozenModel, NonNegativeMoney, UtcDatetime
+from ._base import Currency, FrozenModel, NonBlank, NonNegativeMoney, UtcDatetime
 from .enums import LedgerEntryType, LedgerSubjectType
-
-_NonEmpty = Annotated[str, StringConstraints(min_length=1)]
 
 
 class LedgerEntry(FrozenModel):
@@ -28,8 +22,8 @@ class LedgerEntry(FrozenModel):
     budget_id: str
     entry_type: LedgerEntryType
     amount: NonNegativeMoney
-    currency: _NonEmpty
+    currency: Currency
     subject_type: LedgerSubjectType
-    subject_id: _NonEmpty
+    subject_id: NonBlank
     reservation_id: str | None
     created_at: UtcDatetime

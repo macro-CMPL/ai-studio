@@ -164,6 +164,67 @@ def test_revision_requires_supersedes_id() -> None:
         Artifact(**kwargs)
 
 
+def test_revision_one_rejects_supersedes_id() -> None:
+    kwargs = _valid_artifact_kwargs()
+    kwargs["supersedes_id"] = "anything"  # revision==1 不得有
+    with pytest.raises(ValidationError):
+        Artifact(**kwargs)
+
+
+def test_revision_requires_exact_previous_artifact() -> None:
+    series = ids.series_id("proj_1", "storyboard_frame", "shot_02")
+    payload = _image_payload()
+    kwargs = _valid_artifact_kwargs()
+    kwargs.update(
+        series_id=series,
+        revision=2,
+        artifact_id=ids.artifact_id(series, 2),
+        digest=digest(payload),
+        payload=payload,
+    )
+    # 指向错误的上一版本 -> 拒绝
+    bad = {**kwargs, "supersedes_id": "wrong"}
+    with pytest.raises(ValidationError):
+        Artifact(**bad)
+    # 精确指向 revision 1 -> 接受
+    good = {**kwargs, "supersedes_id": ids.artifact_id(series, 1)}
+    art = Artifact(**good)
+    assert art.supersedes_id == ids.artifact_id(series, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 攻击性反例:ArtifactRef 身份/摘要不可伪造
+# --------------------------------------------------------------------------- #
+
+
+def test_artifact_ref_rejects_wrong_deterministic_id() -> None:
+    series = ids.series_id("proj_1", "storyboard_frame", "shot_02")
+    with pytest.raises(ValidationError):
+        ArtifactRef(
+            artifact_id="forged",
+            series_id=series,
+            revision=1,
+            digest="a" * 64,
+        )
+
+
+def test_artifact_ref_rejects_invalid_digest() -> None:
+    series = ids.series_id("proj_1", "storyboard_frame", "shot_02")
+    with pytest.raises(ValidationError):
+        ArtifactRef(
+            artifact_id=ids.artifact_id(series, 1),
+            series_id=series,
+            revision=1,
+            digest="not-a-sha256",
+        )
+
+
+def test_series_id_distinguishes_none_and_empty_partition() -> None:
+    singleton = ids.series_id("p", "slot", None)
+    empty = ids.series_id("p", "slot", "")
+    assert singleton != empty
+
+
 # --------------------------------------------------------------------------- #
 # 深度不可变
 # --------------------------------------------------------------------------- #
@@ -317,26 +378,45 @@ def test_cardinality_validators() -> None:
 
 def test_provider_operation_requires_job_id_when_submitted() -> None:
     with pytest.raises(ValidationError):
-        ProviderOperation(
-            operation_id="op1",
+        ProviderOperation.create(
             attempt_id="att-1",
             logical_operation_key="k",
             status=ProviderOpStatus.SUBMITTED,
             job_id=None,
             cost_estimate=Decimal("10"),
-            cost_actual=None,
+        )
+
+
+def test_provider_operation_initiated_forbids_job_id() -> None:
+    with pytest.raises(ValidationError):
+        ProviderOperation.create(
+            attempt_id="att-1",
+            logical_operation_key="k",
+            status=ProviderOpStatus.INITIATED,
+            job_id="job-1",
+            cost_estimate=Decimal("10"),
         )
 
 
 def test_provider_operation_rejects_negative_cost() -> None:
     with pytest.raises(ValidationError):
+        ProviderOperation.create(
+            attempt_id="att-1",
+            logical_operation_key="k",
+            status=ProviderOpStatus.INITIATED,
+            cost_estimate=Decimal("-1"),
+        )
+
+
+def test_provider_operation_rejects_wrong_deterministic_id() -> None:
+    with pytest.raises(ValidationError):
         ProviderOperation(
-            operation_id="op1",
+            operation_id="forged",
             attempt_id="att-1",
             logical_operation_key="k",
             status=ProviderOpStatus.INITIATED,
             job_id=None,
-            cost_estimate=Decimal("-1"),
+            cost_estimate=Decimal("10"),
             cost_actual=None,
         )
 
