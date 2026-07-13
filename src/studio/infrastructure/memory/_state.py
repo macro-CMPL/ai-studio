@@ -24,8 +24,9 @@ class OutboxRow:
 class DbState:
     events: list[EventEnvelope[Any]] = field(default_factory=list)
     stream_versions: dict[str, int] = field(default_factory=dict)
-    event_digests: dict[str, str] = field(default_factory=dict)
+    event_digests: dict[str, tuple[str, str]] = field(default_factory=dict)
     global_counter: int = 0
+    # event_id -> (stream_id, payload_digest);用于全局唯一 + 幂等冲突检测。
     inbox: set[tuple[str, str]] = field(default_factory=set)
     outbox: list[OutboxRow] = field(default_factory=list)
     pm_states: dict[str, tuple[int, Any]] = field(default_factory=dict)

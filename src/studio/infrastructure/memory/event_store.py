@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from studio.kernel.envelopes import EventEnvelope
+from studio.kernel.outcomes import Versioned
 from studio.kernel.ports import NewEvent
 
 from ._state import Buffers, DbState
@@ -23,6 +24,11 @@ class MemoryEventStore:
         events = [e for e in self._s.events if e.stream_id == stream_id]
         return sorted(events, key=lambda e: e.sequence)
 
+    def load_stream(self, stream_id: str) -> Versioned[list[EventEnvelope[Any]]]:
+        # 原子快照:version 与 events 同一次读取,不可撕裂。
+        events = self.read_stream(stream_id)
+        return Versioned(version=len(events), value=events)
+
     def read_all(self, after_global_position: int) -> list[EventEnvelope[Any]]:
         events = [
             e for e in self._s.events if e.global_position > after_global_position
@@ -31,26 +37,8 @@ class MemoryEventStore:
 
     def append(
         self, stream_id: str, expected_version: int, events: Sequence[NewEvent]
-    ) -> list[EventEnvelope[Any]]:
+    ) -> list[str]:
         if not events:
             return []
         self._b.append_intents.append((stream_id, expected_version, list(events)))
-        # 临时信封:event_id 权威;sequence/global_position 为占位(commit 时定稿)。
-        base_seq = self._s.stream_versions.get(stream_id, 0)
-        base_pos = self._s.global_counter
-        provisional: list[EventEnvelope[Any]] = []
-        for i, ne in enumerate(events):
-            provisional.append(
-                EventEnvelope(
-                    event_id=ne.event_id,
-                    schema_version=ne.schema_version,
-                    stream_id=stream_id,
-                    sequence=base_seq + i,
-                    global_position=base_pos + i,
-                    correlation_id=ne.correlation_id,
-                    causation_id=ne.causation_id,
-                    recorded_at=ne.recorded_at,
-                    payload=ne.payload,
-                )
-            )
-        return provisional
+        return [ne.event_id for ne in events]

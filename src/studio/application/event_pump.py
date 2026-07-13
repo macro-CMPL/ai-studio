@@ -11,6 +11,7 @@ from typing import Any, Generic, TypeVar
 
 from studio.kernel import identifiers as kids
 from studio.kernel.envelopes import CommandEnvelope, MessagePayload
+from studio.kernel.errors import ContractViolation
 from studio.kernel.ports import Clock, UnitOfWorkFactory
 from studio.kernel.process_manager import ProcessManager
 
@@ -62,10 +63,16 @@ class EventPump(Generic[TPMState, TEvt, TCmd]):
 
             reaction = self._pm.react(pm_state, event)
 
+            seen_command_ids: set[str] = set()
             for pc in reaction.commands:
                 cid = kids.command_id(
                     pm_id, event.event_id, pc.reaction_name, pc.command_key
                 )
+                if cid in seen_command_ids:
+                    raise ContractViolation(
+                        f"同一 Reaction 产生重复 command_id={cid}"
+                    )
+                seen_command_ids.add(cid)
                 command: CommandEnvelope[Any] = CommandEnvelope(
                     command_id=cid,
                     schema_version=self._schema_version,

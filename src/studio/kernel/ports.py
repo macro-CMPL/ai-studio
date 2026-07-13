@@ -29,12 +29,16 @@ class EventStore(Protocol):
 
     def read_stream(self, stream_id: str) -> list[EventEnvelope[Any]]: ...
 
+    def load_stream(self, stream_id: str) -> Versioned[list[EventEnvelope[Any]]]:
+        """原子读取:一次返回 (version, events),避免 state/version 撕裂。"""
+        ...
+
     def read_all(self, after_global_position: int) -> list[EventEnvelope[Any]]: ...
 
     def append(
         self, stream_id: str, expected_version: int, events: Sequence[NewEvent]
-    ) -> list[EventEnvelope[Any]]:
-        """追加事件。冲突抛 ConcurrencyConflict;同 id 异内容抛 IdempotencyConflict。"""
+    ) -> list[str]:
+        """缓冲追加,返回事件 ID(权威值)。校验在 commit 时执行。"""
         ...
 
 
