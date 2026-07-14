@@ -104,14 +104,14 @@ def test_plan_rework_triggers_new_execution_spec() -> None:
     # → ExecutionPlanningPM 使用 plan v2 payload 生成 ExecutionSpec
 
     specs_after = _payloads(stack, ProviderExecutionSpecRecordedEvt)
-    # 至少 2 original + 2 rework = 4
-    assert len(specs_after) >= 4, f"Expected >= 4, got {len(specs_after)}"
+    # 恰好 2 original + 2 rework = 4(收紧为 ==,防止重复重算)
+    assert len(specs_after) == 4, f"Expected == 4, got {len(specs_after)}"
 
     # rework spec 的 attempt_id 必须与 v1 不同(证明 plan v2 进入了规划)
     v1_attempt_ids = {s.attempt_id for s in specs_before}
     rework_specs = [s for s in specs_after if s.attempt_id not in v1_attempt_ids]
-    assert len(rework_specs) >= 2, (
-        f"应有 >=2 个 rework ExecutionSpec (新 attempt),got {len(rework_specs)}"
+    assert len(rework_specs) == 2, (
+        f"应有恰好 2 个 rework ExecutionSpec (新 attempt),got {len(rework_specs)}"
     )
     # 验证 rework spec 的 plan_ref 指向 plan v2(revision > 1)
     for rs in rework_specs:
@@ -123,4 +123,5 @@ def test_plan_rework_triggers_new_execution_spec() -> None:
         e.payload for e in stack.db.state.events
         if isinstance(e.payload, TaskAttemptCreatedEvt) and e.payload.stage_id == "image"
     ]
-    assert len(img_created_evts) >= 4, f"Expected >= 4 image created, got {len(img_created_evts)}"
+    # 恰好 4:2 v1 + 2 v2,无重复重算
+    assert len(img_created_evts) == 4, f"Expected == 4 image created, got {len(img_created_evts)}"
