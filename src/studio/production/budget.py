@@ -159,6 +159,7 @@ class Reservation(BaseModel):
     model_config = ConfigDict(frozen=True)
     operation_id: str
     amount: Decimal
+    currency: str
     quote_digest: str
 
 
@@ -173,6 +174,7 @@ class Settlement(BaseModel):
 class BudgetState(BaseModel):
     model_config = ConfigDict(frozen=True)
     initialized: bool = False
+    project_id: str | None = None
     currency: str | None = None
     total: Decimal = Decimal(0)
     adj_credit: Decimal = Decimal(0)
@@ -180,8 +182,11 @@ class BudgetState(BaseModel):
     captured_total: Decimal = Decimal(0)
     reservations: tuple[Reservation, ...] = ()
     settlements: tuple[Settlement, ...] = ()
-    adjustments: tuple[str, ...] = ()
+    adjustments: tuple[tuple[str, str], ...] = ()  # (entry_id, fingerprint)
     overrun: bool = False
+
+    def adjustment(self, entry_id: str) -> str | None:
+        return next((fp for (eid, fp) in self.adjustments if eid == entry_id), None)
 
     @property
     def reserved_total(self) -> Decimal:
@@ -216,6 +221,14 @@ class BudgetDecider:
     def decide(
         self, state: BudgetState, command: BudgetCommand
     ) -> Accepted[BudgetEvent] | Rejected:
+        # owner 校验:非初始化命令的 project 必须与本预算一致。
+        if (
+            not isinstance(command, InitializeBudgetCmd)
+            and state.project_id is not None
+            and command.project_id != state.project_id
+        ):
+            return Rejected("wrong_project", "project 与本预算流不一致")
+
         if isinstance(command, InitializeBudgetCmd):
             return self._initialize(state, command)
         if isinstance(command, ReserveBudgetCmd):
@@ -254,15 +267,22 @@ class BudgetDecider:
     def _reserve(
         self, state: BudgetState, cmd: ReserveBudgetCmd
     ) -> Accepted[BudgetEvent] | Rejected:
-        if (bad := self._check_currency(state, cmd.currency)) is not None:
-            return bad
-        if state.settlement(cmd.operation_id) is not None:
-            return Rejected("already_settled", "该 operation 已结算")
+        if not state.initialized:
+            return Rejected("not_initialized", "预算未初始化")
+        # 先按 operation 做幂等判定(含币种):同 op 换币种是幂等冲突,而非普通 currency rejection。
         prior = state.reservation(cmd.operation_id)
         if prior is not None:
-            if prior.amount == cmd.amount and prior.quote_digest == cmd.quote_digest:
+            if (
+                prior.amount == cmd.amount
+                and prior.currency == cmd.currency
+                and prior.quote_digest == cmd.quote_digest
+            ):
                 return Accepted(())  # 幂等
-            raise IdempotencyConflict(cmd.operation_id, "reserve 金额/quote 不一致")
+            raise IdempotencyConflict(cmd.operation_id, "reserve 金额/币种/quote 不一致")
+        if state.settlement(cmd.operation_id) is not None:
+            return Rejected("already_settled", "该 operation 已结算")
+        if cmd.currency != state.currency:
+            return Rejected("currency_mismatch", "币种与预算不一致")
         if state.overrun or state.available < cmd.amount:
             return Accepted(
                 (
@@ -363,6 +383,8 @@ class BudgetDecider:
         reservation = state.reservation(cmd.operation_id)
         if reservation is None:
             return Rejected("unknown_reservation", "无对应预留")
+        if reservation.quote_digest != cmd.quote_digest:
+            raise IdempotencyConflict(cmd.operation_id, "release quote 与 reserve 不一致")
         assert state.currency is not None
         return Accepted(
             (
@@ -391,8 +413,12 @@ class BudgetDecider:
     ) -> Accepted[BudgetEvent] | Rejected:
         if (bad := self._check_currency(state, cmd.currency)) is not None:
             return bad
-        if cmd.entry_id in state.adjustments:
-            return Accepted(())  # 幂等
+        fingerprint = _adjust_fingerprint(cmd)
+        prior = state.adjustment(cmd.entry_id)
+        if prior is not None:
+            if prior == fingerprint:
+                return Accepted(())  # 幂等
+            raise IdempotencyConflict(cmd.entry_id, "adjustment 同 entry 不同内容")
         return Accepted(
             (
                 ProposedEvent(
@@ -412,7 +438,12 @@ class BudgetDecider:
     def evolve(self, state: BudgetState, event: BudgetEvent) -> BudgetState:
         if isinstance(event, BudgetInitializedEvt):
             return state.model_copy(
-                update={"initialized": True, "currency": event.currency, "total": event.total}
+                update={
+                    "initialized": True,
+                    "project_id": event.project_id,
+                    "currency": event.currency,
+                    "total": event.total,
+                }
             )
         if isinstance(event, BudgetReservedEvt):
             return state.model_copy(
@@ -422,6 +453,7 @@ class BudgetDecider:
                         Reservation(
                             operation_id=event.operation_id,
                             amount=event.amount,
+                            currency=event.currency,
                             quote_digest=event.quote_digest,
                         ),
                     )
@@ -452,18 +484,44 @@ class BudgetDecider:
                 }
             )
         if isinstance(event, BudgetAdjustedEvt):
+            fp = _adjust_fingerprint_evt(event)
+            base = {"adjustments": (*state.adjustments, (event.entry_id, fp))}
             if event.direction is LedgerDirection.CREDIT:
                 return state.model_copy(
-                    update={
-                        "adj_credit": state.adj_credit + event.amount,
-                        "adjustments": (*state.adjustments, event.entry_id),
-                    }
+                    update={"adj_credit": state.adj_credit + event.amount, **base}
                 )
             return state.model_copy(
-                update={
-                    "adj_debit": state.adj_debit + event.amount,
-                    "adjustments": (*state.adjustments, event.entry_id),
-                }
+                update={"adj_debit": state.adj_debit + event.amount, **base}
             )
         # BudgetReservationDeclinedEvt / BudgetReleasedEvt:无状态迁移(信息事实)
         return state
+
+
+def _adjust_fingerprint(cmd: AdjustBudgetCmd) -> str:
+    from studio.production.execution_spec import canon_money
+    from studio.serialization import digest
+
+    return digest(
+        {
+            "direction": cmd.direction.value,
+            "amount": canon_money(cmd.amount),
+            "currency": cmd.currency,
+            "reason": cmd.reason,
+            "authority_ref": cmd.authority_ref,
+        }
+    )
+
+
+def _adjust_fingerprint_evt(evt: BudgetAdjustedEvt) -> str:
+    from studio.production.execution_spec import canon_money
+    from studio.serialization import digest
+
+    return digest(
+        {
+            "direction": evt.direction.value,
+            "amount": canon_money(evt.amount),
+            "currency": evt.currency,
+            "reason": evt.reason,
+            "authority_ref": evt.authority_ref,
+        }
+    )

@@ -7,6 +7,13 @@ from typing import Any
 
 import pytest
 
+from studio.domain import ids as domain_ids
+from studio.domain.artifacts import (
+    ArtifactRef,
+    ImagePlanPayload,
+    OperationParam,
+    PlannedOperation,
+)
 from studio.domain.enums import LedgerDirection, ProviderOpStatus
 from studio.kernel.decisions import Accepted, Rejected
 from studio.kernel.errors import IdempotencyConflict
@@ -196,12 +203,30 @@ def _adjust(entry: str, direction: LedgerDirection, amount: str) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _spec() -> ProviderExecutionSpec:
-    return ProviderExecutionSpec(
-        attempt_id="att-1", logical_operation_key="shot_01:image:v0",
-        provider_id="fake", provider_version="1", request_ref="req://1",
-        request_digest="a" * 64, estimated_cost=Decimal(10), currency="CNY",
-        pricing_version="1",
+def _plan_payload(op_key: str = "shot_01:image:v0") -> ImagePlanPayload:
+    return ImagePlanPayload(
+        operations=(
+            PlannedOperation(
+                logical_operation_key=op_key, op_type="gen",
+                params=(OperationParam(key="shot", value="shot_01"),),
+            ),
+        )
+    )
+
+
+def _plan_ref() -> ArtifactRef:
+    series = domain_ids.series_id("proj", "plan", "shot_01")
+    return ArtifactRef(
+        artifact_id=domain_ids.artifact_id(series, 1), series_id=series,
+        revision=1, digest="c" * 64,
+    )
+
+
+def _spec(op_key: str = "shot_01:image:v0", cost: str = "10") -> ProviderExecutionSpec:
+    return ProviderExecutionSpec.from_plan(
+        attempt_id="att-1", plan_ref=_plan_ref(), plan_payload=_plan_payload(op_key),
+        provider_id="fake", provider_version="1", estimated_cost=Decimal(cost),
+        currency="CNY", pricing_version="1", request_ref="req://1",
     )
 
 
@@ -315,3 +340,143 @@ def test_provider_failed_from_submitted() -> None:
                         provider_event_id="e2"),
     )
     assert s.status is ProviderOpStatus.FAILED and s.charged is True
+
+
+# --------------------------------------------------------------------------- #
+# 对抗:owner 身份 / 内容指纹 / claim 后禁 abort / Plan 契约
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_reinit_same_op_different_spec_conflict() -> None:
+    d, s = _initiated()
+    op = _op_id()
+    # 同 operation_id、不同 spec(不同报价) -> 冲突
+    other = _spec(cost="99")
+    with pytest.raises(IdempotencyConflict):
+        d.decide(s, InitiateProviderOpCmd(operation_id=op, spec=other))
+
+
+def test_provider_command_operation_id_mismatch_rejected() -> None:
+    d, s = _initiated()
+    dec = d.decide(s, ClaimSubmissionCmd(operation_id="wrong-op"))
+    assert isinstance(dec, Rejected) and dec.code == "wrong_operation"
+
+
+def test_provider_same_event_id_different_payload_conflict() -> None:
+    d, s = _initiated()
+    op = _op_id()
+    s, _ = _apply(d, s, ClaimSubmissionCmd(operation_id=op))
+    s, _ = _apply(d, s, RecordSubmittedCmd(operation_id=op, job_id="J1", provider_event_id="e1"))
+    # 同 provider_event_id 但 job 不同 -> 冲突(不是静默 no-op)
+    with pytest.raises(IdempotencyConflict):
+        d.decide(s, RecordSubmittedCmd(operation_id=op, job_id="J2", provider_event_id="e1"))
+
+
+def test_provider_claimed_cannot_abort() -> None:
+    d, s = _initiated()
+    op = _op_id()
+    s, _ = _apply(d, s, ClaimSubmissionCmd(operation_id=op))
+    dec = d.decide(s, AbortBeforeSubmissionCmd(operation_id=op, reason="x"))
+    assert isinstance(dec, Rejected) and dec.code == "bad_transition"
+
+
+def test_provider_abort_then_late_initiate_rejected() -> None:
+    d = ProviderOperationDecider()
+    op = _op_id()
+    s, _ = _apply(d, d.initial_state(), AbortBeforeSubmissionCmd(operation_id=op, reason="orphan"))
+    assert s.status is ProviderOpStatus.ABORTED
+    dec = d.decide(s, InitiateProviderOpCmd(operation_id=op, spec=_spec()))
+    assert isinstance(dec, Rejected) and dec.code == "aborted"
+
+
+def test_provider_uncharged_failure_with_nonzero_actual_rejected() -> None:
+    d, s = _initiated()
+    op = _op_id()
+    s, _ = _apply(d, s, ClaimSubmissionCmd(operation_id=op))
+    s, _ = _apply(d, s, RecordSubmittedCmd(operation_id=op, job_id="J1", provider_event_id="e1"))
+    dec = d.decide(
+        s,
+        RecordFailedCmd(
+            operation_id=op, charged=False, cost_actual=Decimal(5), provider_event_id="e2"
+        ),
+    )
+    assert isinstance(dec, Rejected) and dec.code == "charged_cost_mismatch"
+
+
+def test_execution_spec_requires_exactly_one_operation() -> None:
+    two_ops = ImagePlanPayload(
+        operations=(
+            PlannedOperation(logical_operation_key="a", op_type="gen", params=()),
+            PlannedOperation(logical_operation_key="b", op_type="gen", params=()),
+        )
+    )
+    with pytest.raises(ValueError, match="恰好一个"):
+        ProviderExecutionSpec.from_plan(
+            attempt_id="att-1", plan_ref=_plan_ref(), plan_payload=two_ops,
+            provider_id="fake", provider_version="1", estimated_cost=Decimal(10),
+            currency="CNY", pricing_version="1", request_ref="req://1",
+        )
+
+
+def test_execution_spec_membership_check() -> None:
+    from studio.domain.enums import PropagationMode
+    from studio.production.values import BindingItem
+
+    spec = _spec()
+    good = BindingItem.from_ref(
+        requirement_key="plan", logical_slot="plan", partition_key="shot_01",
+        ref=_plan_ref(), propagation_mode=PropagationMode.PARTITION_PRESERVING,
+    )
+    spec.verify_membership((good,))  # 不抛
+    other_series = domain_ids.series_id("proj", "plan", "shot_99")
+    wrong = BindingItem.from_ref(
+        requirement_key="plan", logical_slot="plan", partition_key="shot_99",
+        ref=ArtifactRef(
+            artifact_id=domain_ids.artifact_id(other_series, 1), series_id=other_series,
+            revision=1, digest="d" * 64,
+        ),
+        propagation_mode=PropagationMode.PARTITION_PRESERVING,
+    )
+    with pytest.raises(ValueError, match="不属于"):
+        spec.verify_membership((wrong,))
+
+
+# --------------------------------------------------------------------------- #
+# 对抗:预算 owner / release quote / adjustment 指纹
+# --------------------------------------------------------------------------- #
+
+
+def test_budget_wrong_project_rejected() -> None:
+    d, s = _init_budget("100")
+    dec = d.decide(
+        s,
+        ReserveBudgetCmd(project_id="other", operation_id="op1", amount=Decimal(1),
+                         currency="CNY", quote_digest="q1"),
+    )
+    assert isinstance(dec, Rejected) and dec.code == "wrong_project"
+
+
+def test_budget_release_wrong_quote_conflict() -> None:
+    d, s = _init_budget("100")
+    s, _ = _apply(d, s, _reserve("op1", "30", quote="q1"))
+    with pytest.raises(IdempotencyConflict):
+        d.decide(s, ReleaseBudgetCmd(project_id="p", operation_id="op1", quote_digest="WRONG"))
+
+
+def test_budget_reserve_same_op_different_currency_conflict() -> None:
+    d, s = _init_budget("100")
+    s, _ = _apply(d, s, _reserve("op1", "30", quote="q1"))
+    # 同 op 换币种 -> 幂等冲突(而非 currency rejection)
+    with pytest.raises(IdempotencyConflict):
+        d.decide(
+            s,
+            ReserveBudgetCmd(project_id="p", operation_id="op1", amount=Decimal(30),
+                             currency="USD", quote_digest="q1"),
+        )
+
+
+def test_budget_adjustment_same_entry_different_payload_conflict() -> None:
+    d, s = _init_budget("100")
+    s, _ = _apply(d, s, _adjust("e1", LedgerDirection.CREDIT, "50"))
+    with pytest.raises(IdempotencyConflict):
+        d.decide(s, _adjust("e1", LedgerDirection.DEBIT, "50"))
