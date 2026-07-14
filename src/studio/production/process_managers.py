@@ -146,14 +146,14 @@ class ProjectExpansion(BaseModel):
         )
 
     def resolve(self, output_key: str, partition: str | None) -> ArtifactRef | None:
-        return next(
-            (
-                e.ref
-                for e in self.accepted
-                if e.output_key == output_key and e.partition_key == partition
-            ),
-            None,
-        )
+        matches = [
+            e.ref
+            for e in self.accepted
+            if e.output_key == output_key and e.partition_key == partition
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda r: r.revision)  # 绑定当前(最新接受)版本
 
     def activated_partitions(self, stage_id: str) -> tuple[str, ...]:
         return tuple(p for (sid, p) in self.activated if sid == stage_id)

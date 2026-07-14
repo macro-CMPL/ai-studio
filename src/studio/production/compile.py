@@ -168,13 +168,19 @@ def compile_from(
     if len(set(stage_ids)) != len(stage_ids):
         raise CompilationError("stage_id 必须唯一")
 
+    for s in stages:
+        if len(s.produces) != 1:
+            raise CompilationError(f"{s.stage_id}: M3 要求恰好一个 OutputSpec")
+
     producers = _resolve_producers(stages)
+    # 各 producer 的输出分区契约,用于校验分区源可激活。
+    output_kind: dict[str, PartitioningKind] = {
+        s.stage_id: s.produces[0].partitioning.kind for s in stages
+    }
     edges: dict[str, set[str]] = {s.stage_id: set() for s in stages}
 
     compiled: list[CompiledStage] = []
     for s in stages:
-        if len(s.produces) != 1:
-            raise CompilationError(f"{s.stage_id}: M3 要求恰好一个 OutputSpec")
         out = s.produces[0]
 
         creqs: list[CompiledRequirement] = []
@@ -210,6 +216,23 @@ def compile_from(
         mode, partition_source, driver_stage, upstream_stage = _classify(
             s.stage_id, creqs, out.partitioning.kind, out.partitioning.from_key
         )
+
+        # 分区源可激活性:基于 producer 的输出分区契约交叉校验。
+        if partition_source is not None:
+            src_kind = output_kind[partition_source.producer_stage]
+            if mode is StageMode.FANOUT and src_kind is not PartitioningKind.SINGLETON:
+                raise CompilationError(
+                    f"{s.stage_id}: FANOUT driver 必须来自 singleton producer"
+                    "(暂不支持分区化/嵌套 FANOUT driver)"
+                )
+            if mode is StageMode.PER_PARTITION and src_kind not in (
+                PartitioningKind.DYNAMIC_FROM,
+                PartitioningKind.INHERIT_PARTITION,
+            ):
+                raise CompilationError(
+                    f"{s.stage_id}: PER_PARTITION 分区源的 producer 必须产出分区产物"
+                    "(singleton 无法激活分区)"
+                )
 
         compiled.append(
             CompiledStage(

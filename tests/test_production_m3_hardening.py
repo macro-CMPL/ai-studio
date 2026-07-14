@@ -816,3 +816,96 @@ def test_compiler_rejects_partition_contract_mismatch() -> None:
     )
     with pytest.raises(CompilationError):
         compile_from((_producer_stage("root", ArtifactType.SCRIPT, "root"), bad))
+
+
+def test_assembler_binds_current_version_when_side_input_arrives_late() -> None:
+    spec = compile_from(_multi_input_stages())
+    selectors = {("selP", "1"): lambda p: ("shot_01",)}
+    pm = ExpansionProcessManager(spec, selectors)
+    project = "p"
+    sb_series = domain_ids.series_id(project, "sb", None)
+    plan_series = domain_ids.series_id(project, "plan", "shot_01")
+
+    events: list[ProductionEvent] = [
+        PipelineInitializedEvt(project_id=project, pipeline_spec_id=spec.spec_id),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c-sb", attempt_id="att-sb", project_id=project,
+            series_id=sb_series, output_key="sb", partition_key=None, digest="a" * 64,
+            payload=StoryboardPayload(shots=(ShotSpec(shot_id="shot_01", description="d"),)),
+        ),
+        _accepted_evt(project, "sb", None, 1, "att-sb", "a" * 64),
+        StageExpandedEvt(
+            project_id=project, stage_id="plan",
+            driver_ref=_ref(sb_series, 1, "a" * 64), partitions=("shot_01",),
+            task_keys=(identity.task_key(project, "plan", "shot_01"),),
+        ),
+        # plan v1、plan v2 先后接受(分区源两次),style 尚未到 -> 都不创建
+        _accepted_evt(project, "plan", "shot_01", 1, "att-plan1", "b" * 64),
+        _accepted_evt(project, "plan", "shot_01", 2, "att-plan2", "e" * 64),
+        # style 聚合输入到达 -> 装配,应绑定 plan 的**当前版本 v2**
+        _accepted_evt(project, "style", None, 1, "att-style", "c" * 64),
+    ]
+    commands = _run_pm(pm, events)
+    img_creates = [
+        c.payload
+        for c in commands
+        if isinstance(c.payload, CreateTaskAttemptCmd) and c.payload.stage_id == "img"
+    ]
+    assert len(img_creates) == 1
+    plan_binding = next(b for b in img_creates[0].exact_refs if b.logical_slot == "plan")
+    assert plan_binding.revision == 2  # 绑定当前版本,而非最旧 v1
+    assert plan_binding.series_id == plan_series
+
+
+def test_compiler_rejects_singleton_partition_source() -> None:
+    consumer = StageSpec(
+        stage_id="consumer", executor_kind=ExecutorKind.PROVIDER,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.COSTED}), cost_mode=CostMode.METERED,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="root",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE, logical_slot="out", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    with pytest.raises(CompilationError):
+        compile_from((_producer_stage("root", ArtifactType.SCRIPT, "root"), consumer))
+
+
+def test_compiler_rejects_partitioned_fanout_driver() -> None:
+    nested = StageSpec(
+        stage_id="nested", executor_kind=ExecutorKind.AGENT,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}), cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.IMAGE, logical_slot="plan",
+                cardinality=Cardinality(
+                    kind=CardinalityKind.DYNAMIC_PARTITION_BY, partition_by="k2"
+                ),
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="s2", partition_selector_version="1",
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.STITCH, logical_slot="nested", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.DYNAMIC_FROM, from_key="k2"),
+            ),
+        ),
+    )
+    stages = (
+        _producer_stage("sb", ArtifactType.STORYBOARD, "sb"),
+        _fanout_stage("plan", "plan", ArtifactType.STORYBOARD, "sb", "selP"),
+        nested,  # 以分区化的 plan 作为 FANOUT driver -> 拒绝
+    )
+    with pytest.raises(CompilationError):
+        compile_from(stages)
