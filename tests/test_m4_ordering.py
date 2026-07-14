@@ -127,6 +127,28 @@ def test_newer_command_skips_intermediate_states() -> None:
     assert s2.status is _S.FAILED and s2.last_status_revision == 20
 
 
+def test_same_target_newer_revision_advances_watermark() -> None:
+    """WaitingProvider(10) → WaitingProvider(30) 同目标但更新 revision 必须推进 watermark。
+
+    否则后到的 WaitingReconciliation(20) 会因 watermark 停在 10 而错误迁移。
+    """
+    d, s, aid = _at_waiting_budget()
+    # (1) WaitingProvider(10) -> WAITING_PROVIDER, revision=10, 产 1 事件
+    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert isinstance(dec, Accepted) and len(dec.events) == 1
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 10
+    # (2) WaitingProvider(30) 同目标、更新 revision -> 仍产 1 事件推进 watermark 到 30
+    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=30))
+    assert isinstance(dec, Accepted) and len(dec.events) == 1
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 30
+    # (3) WaitingReconciliation(20) 迟到 -> 20 < 30 stale -> 0 事件,状态不变
+    s, dec = _apply(
+        d, s, MarkWaitingReconciliationCmd(attempt_id=aid, status_revision=20)
+    )
+    assert isinstance(dec, Accepted) and dec.events == ()
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 30
+
+
 def test_no_revision_backward_compatible() -> None:
     """status_revision=None -> 不做乱序校验。"""
     d, s, aid = _at_waiting_budget()

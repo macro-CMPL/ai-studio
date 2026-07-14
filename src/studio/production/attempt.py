@@ -307,11 +307,15 @@ class TaskAttemptDecider:
                         f"status_revision={status_revision}",
                         "同 revision 不同目标/内容",
                     )
-        # 幂等:已是目标状态
+        # 已是目标状态:仅当无 revision 或 revision 未超过 watermark 时才幂等返回;
+        # 若 revision > watermark,仍需产出一条推进 watermark 的事件(状态不变),
+        # 否则后续更低 revision 的迟到命令会错误地改变状态。
         if state.status is target:
-            return Accepted(())
+            if status_revision is None or status_revision <= state.last_status_revision:
+                return Accepted(())
+            # 落 fall-through:发出事件推进 watermark。
         # 终态保护
-        if state.status in (_S.SUCCEEDED, _S.FAILED, _S.BLOCKED):
+        elif state.status in (_S.SUCCEEDED, _S.FAILED, _S.BLOCKED):
             if status_revision is not None:
                 return Accepted(())
             return Rejected("bad_transition", f"{target} 不允许自 {state.status}")
