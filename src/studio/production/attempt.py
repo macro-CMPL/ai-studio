@@ -220,29 +220,33 @@ class TaskAttemptDecider:
     def _record_result(
         self, state: AttemptState, cmd: RecordProviderResultCmd
     ) -> Accepted[AttemptEvent] | Rejected:
-        # status_revision 乱序保护(同 _status_transition 逻辑)
+        # status_revision 乱序保护(与 _status_transition 完全相同的规则)
+        fp = _succeeded_fingerprint(cmd.operation_id, cmd.blob_ref, cmd.payload)
         if cmd.status_revision is not None:
             if cmd.status_revision < state.last_status_revision:
                 return Accepted(())  # 过时,幂等忽略
-            if cmd.status_revision == state.last_status_revision and state.status is _S.SUCCEEDED:
-                # 同 revision 重投,检查幂等(下方)
-                pass
-        # SUCCEEDED 幂等检查(允许 result 先到 → SUCCEEDED,后续同结果重投)
+            if cmd.status_revision == state.last_status_revision:
+                if state.last_status_fingerprint == fp:
+                    return Accepted(())  # 幂等
+                if state.last_status_fingerprint is not None:
+                    raise IdempotencyConflict(
+                        f"status_revision={cmd.status_revision}",
+                        "同 revision 不同目标/内容",
+                    )
+        # SUCCEEDED 幂等检查
         if state.status is _S.SUCCEEDED:
             if state.spec is None or cmd.operation_id != state.spec.operation_id:
                 return Rejected("operation_mismatch", "operation_id 与 spec 不一致")
-            fingerprint = _result_fingerprint(
+            if state.result_fingerprint == _result_fingerprint(
                 cmd.attempt_id, cmd.operation_id, cmd.blob_ref, cmd.payload
-            )
-            if state.result_fingerprint == fingerprint:
+            ):
                 return Accepted(())
             raise IdempotencyConflict(cmd.attempt_id, "provider 结果不一致")
-        # 允许从 WAITING_BUDGET 及后续 provider 状态接收结果(新命令可跳过中间状态)
+        # 允许从 WAITING_BUDGET 及后续 provider 状态接收结果
         if state.status not in (
             _S.WAITING_BUDGET, _S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION
         ):
             return Rejected("bad_transition", f"record_result 不允许自 {state.status}")
-        # owner(attempt_id)已在 decide 顶层校验
         if state.spec is None or cmd.operation_id != state.spec.operation_id:
             return Rejected("operation_mismatch", "operation_id 与 spec 不一致")
         stage = self._spec.by_stage(state.stage_id) if state.stage_id else None
@@ -265,6 +269,7 @@ class TaskAttemptDecider:
                         series_id=state.series_id or "", output_key=state.output_key,
                         partition_key=state.partition_key, digest=digest(cmd.payload),
                         payload=cmd.payload,
+                        status_revision=cmd.status_revision,
                     ),
                 ),
             )
@@ -392,11 +397,16 @@ class TaskAttemptDecider:
         if isinstance(event, ArtifactCandidateProducedEvt):
             op_id = state.spec.operation_id if state.spec else None
             blob = getattr(event.payload, "blob_ref", None)
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.SUCCEEDED,
                     "result_fingerprint": _result_fingerprint(
                         state.attempt_id, op_id, blob, event.payload
+                    ),
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _succeeded_fingerprint(
+                        op_id, blob, event.payload
                     ),
                 }
             )
@@ -429,3 +439,17 @@ def _status_fingerprint(target: TaskAttemptStatus, event: AttemptEvent) -> str:
 def _resolve_rev(event_rev: int | None, current: int) -> int:
     """事件 revision:有则用事件值,无则递增(向后兼容)。"""
     return event_rev if event_rev is not None else current + 1
+
+
+def _succeeded_fingerprint(
+    operation_id: str | None, blob_ref: str | None, payload: ArtifactPayload
+) -> str:
+    """SUCCEEDED 状态指纹:覆盖 SUCCEEDED + operation_id + blob_ref + payload_digest。"""
+    return digest(
+        {
+            "target": _S.SUCCEEDED.value,
+            "operation_id": operation_id,
+            "blob_ref": blob_ref,
+            "payload_digest": digest(payload),
+        }
+    )

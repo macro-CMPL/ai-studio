@@ -122,6 +122,7 @@ class ArtifactCandidateProducedEvt(MessagePayload):
     partition_key: str | None
     digest: str
     payload: ArtifactPayload
+    status_revision: int | None = None
 
 
 class ArtifactVersionProposedEvt(MessagePayload):

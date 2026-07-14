@@ -176,6 +176,7 @@ def test_result_before_waiting_provider_succeeds() -> None:
 
     Result 从 WAITING_BUDGET 被接受(status_revision 允许跳过中间状态);
     后到的 WaitingProvider 被忽略,最终保持 SUCCEEDED。
+    last_status_revision 必须为 30(不是 1)。
     """
     d, s, aid = _at_waiting_budget()
     spec = _spec(aid)
@@ -187,7 +188,8 @@ def test_result_before_waiting_provider_succeeds() -> None:
     ))
     assert isinstance(dec, Accepted) and len(dec.events) == 1
     assert s.status is _S.SUCCEEDED
-    # WaitingProvider arrives later (revision=10) -> terminal state, stale -> ignored
+    assert s.last_status_revision == 30  # revision 持久化
+    # WaitingProvider arrives later (revision=10) -> stale -> ignored
     s2, dec2 = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
     assert isinstance(dec2, Accepted) and dec2.events == ()
     assert s2.status is _S.SUCCEEDED
@@ -283,3 +285,59 @@ def test_result_pm_emits_status_revision() -> None:
     assert len(record) == 1
     # global_position of settlement event = 30
     assert record[0].payload.status_revision == 30
+
+
+def test_result_first_persists_revision_on_replay() -> None:
+    """Result(revision=30) → SUCCEEDED 后,last_status_revision==30 且重放不丢。"""
+    d, s, aid = _at_waiting_budget()
+    spec = _spec(aid)
+    payload = ImagePayload(shot_id=_PART, prompt="p", blob_ref="blob://final")
+    s, _ = _apply(d, s, RecordProviderResultCmd(
+        attempt_id=aid, operation_id=spec.operation_id, blob_ref="blob://final",
+        payload=payload, status_revision=30,
+    ))
+    assert s.status is _S.SUCCEEDED and s.last_status_revision == 30
+    # 模拟重放:重新 evolve 该事件,revision 仍为 30
+    from studio.production.payloads import ArtifactCandidateProducedEvt
+
+    evt = ArtifactCandidateProducedEvt(
+        candidate_id="c", attempt_id=aid, project_id=_P,
+        series_id=domain_ids.series_id(_P, "image", _PART),
+        output_key="image", partition_key=_PART, digest=digest(payload),
+        payload=payload, status_revision=30,
+    )
+    fresh = d.initial_state()
+    # 构造到 WAITING_BUDGET 再 evolve candidate
+    cmd = CreateTaskAttemptCmd(
+        attempt_id=aid, project_id=_P, stage_id="image", partition_key=_PART,
+        output_key="image", series_id=domain_ids.series_id(_P, "image", _PART),
+        exact_refs=(_plan_binding(),),
+    )
+    fresh, _ = _apply(d, fresh, cmd)
+    fresh, _ = _apply(d, fresh, RecordExecutionSpecCmd(attempt_id=aid, spec=spec))
+    replayed = d.evolve(fresh, evt)
+    assert replayed.status is _S.SUCCEEDED
+    assert replayed.last_status_revision == 30
+
+
+def test_waiting_provider_then_result_same_revision_conflicts() -> None:
+    """WaitingProvider(30) 后 Result(30) → IdempotencyConflict。
+
+    同 global_position 只能对应一个权威事实。
+    """
+    import pytest
+
+    from studio.kernel.errors import IdempotencyConflict as IC
+
+    d, s, aid = _at_waiting_budget()
+    spec = _spec(aid)
+    # WaitingProvider at revision=30
+    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=30))
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 30
+    # Result at same revision=30 -> conflict (different fingerprint)
+    payload = ImagePayload(shot_id=_PART, prompt="p", blob_ref="blob://final")
+    with pytest.raises(IC):
+        d.decide(s, RecordProviderResultCmd(
+            attempt_id=aid, operation_id=spec.operation_id, blob_ref="blob://final",
+            payload=payload, status_revision=30,
+        ))
