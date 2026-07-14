@@ -62,7 +62,7 @@ class AttemptState(BaseModel):
     exact_refs: tuple[BindingItem, ...] = ()
     spec: ProviderExecutionSpec | None = None
     result_fingerprint: str | None = None
-    provider_phase: int = 0  # 单调递增;乱序命令低于本值被幂等忽略
+    last_status_revision: int = 0  # 最后处理的 status_revision(causal event global_position)
 
 
 class TaskAttemptDecider:
@@ -93,33 +93,31 @@ class TaskAttemptDecider:
         if isinstance(command, RecordExecutionSpecCmd):
             return self._record_spec(state, command)
         if isinstance(command, MarkWaitingProviderCmd):
-            return self._transition(
-                state, {_S.WAITING_BUDGET, _S.WAITING_RECONCILIATION}, _S.WAITING_PROVIDER,
+            return self._status_transition(
+                state, _S.WAITING_PROVIDER,
                 AttemptWaitingProviderEvt(attempt_id=command.attempt_id), "waiting-provider",
-                min_phase=command.min_provider_phase,
+                status_revision=command.status_revision,
             )
         if isinstance(command, MarkWaitingReconciliationCmd):
-            return self._transition(
-                state, {_S.WAITING_PROVIDER}, _S.WAITING_RECONCILIATION,
+            return self._status_transition(
+                state, _S.WAITING_RECONCILIATION,
                 AttemptWaitingReconciliationEvt(attempt_id=command.attempt_id),
                 "waiting-reconciliation",
-                min_phase=command.min_provider_phase,
+                status_revision=command.status_revision,
             )
         if isinstance(command, MarkBlockedCmd):
-            return self._transition(
-                state, {_S.WAITING_BUDGET}, _S.BLOCKED,
+            return self._status_transition(
+                state, _S.BLOCKED,
                 AttemptBlockedEvt(attempt_id=command.attempt_id, reason=command.reason),
                 "blocked",
-                min_phase=command.min_provider_phase,
+                status_revision=command.status_revision,
             )
         if isinstance(command, MarkFailedCmd):
-            return self._transition(
-                state,
-                {_S.WAITING_BUDGET, _S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION},
-                _S.FAILED,
+            return self._status_transition(
+                state, _S.FAILED,
                 AttemptFailedEvt(attempt_id=command.attempt_id, reason=command.reason),
                 "failed",
-                min_phase=command.min_provider_phase,
+                status_revision=command.status_revision,
             )
         if isinstance(command, RecordProviderResultCmd):
             return self._record_result(state, command)
@@ -221,12 +219,29 @@ class TaskAttemptDecider:
     def _record_result(
         self, state: AttemptState, cmd: RecordProviderResultCmd
     ) -> Accepted[AttemptEvent] | Rejected:
+        # status_revision 乱序保护(同 _status_transition 逻辑)
+        if cmd.status_revision is not None:
+            if cmd.status_revision < state.last_status_revision:
+                return Accepted(())  # 过时,幂等忽略
+            if cmd.status_revision == state.last_status_revision and state.status is _S.SUCCEEDED:
+                # 同 revision 重投,检查幂等(下方)
+                pass
+        # SUCCEEDED 幂等检查(允许 result 先到 → SUCCEEDED,后续同结果重投)
+        if state.status is _S.SUCCEEDED:
+            if state.spec is None or cmd.operation_id != state.spec.operation_id:
+                return Rejected("operation_mismatch", "operation_id 与 spec 不一致")
+            fingerprint = _result_fingerprint(
+                cmd.attempt_id, cmd.operation_id, cmd.blob_ref, cmd.payload
+            )
+            if state.result_fingerprint == fingerprint:
+                return Accepted(())
+            raise IdempotencyConflict(cmd.attempt_id, "provider 结果不一致")
+        # 允许从 WAITING_BUDGET 及后续 provider 状态接收结果(新命令可跳过中间状态)
         if state.status not in (
-            _S.SUCCEEDED, _S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION
+            _S.WAITING_BUDGET, _S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION
         ):
             return Rejected("bad_transition", f"record_result 不允许自 {state.status}")
-        # owner(attempt_id)已在 decide 顶层校验;此处先封 operation_id / 输出类型 / blob_ref,
-        # 再比对结果指纹,避免伪造 operation_id/blob_ref 借相同 payload 冒充幂等成功。
+        # owner(attempt_id)已在 decide 顶层校验
         if state.spec is None or cmd.operation_id != state.spec.operation_id:
             return Rejected("operation_mismatch", "operation_id 与 spec 不一致")
         stage = self._spec.by_stage(state.stage_id) if state.stage_id else None
@@ -236,13 +251,6 @@ class TaskAttemptDecider:
         payload_blob = getattr(cmd.payload, "blob_ref", None)
         if payload_blob is not None and payload_blob != cmd.blob_ref:
             return Rejected("blob_ref_mismatch", "payload.blob_ref 与结果不一致")
-        fingerprint = _result_fingerprint(
-            cmd.attempt_id, cmd.operation_id, cmd.blob_ref, cmd.payload
-        )
-        if state.status is _S.SUCCEEDED:
-            if state.result_fingerprint == fingerprint:
-                return Accepted(())  # 幂等(全字段一致)
-            raise IdempotencyConflict(cmd.attempt_id, "provider 结果不一致")
         assert state.output_key is not None
         return Accepted(
             (
@@ -263,23 +271,41 @@ class TaskAttemptDecider:
 
     # -- helpers ----------------------------------------------------------- #
 
-    def _transition(
+    def _status_transition(
         self,
         state: AttemptState,
-        allowed: set[TaskAttemptStatus],
         target: TaskAttemptStatus,
         event: AttemptEvent,
         key: str,
         *,
-        min_phase: int | None = None,
+        status_revision: int | None = None,
     ) -> Accepted[AttemptEvent] | Rejected:
-        # 乱序保护:命令携带 min_provider_phase,若低于当前 phase 则幂等忽略(过时命令)。
-        if min_phase is not None and min_phase < state.provider_phase:
+        """乱序安全的状态迁移。
+
+        revision < last_status_revision → 幂等忽略(过时命令)。
+        revision > last_status_revision → 允许跳过中间观察状态(新命令先到)。
+        revision == last_status_revision + target 相同 → 幂等。
+        None → 向后兼容(不做乱序校验,按 allowed 判定;仅限 WAITING_BUDGET 之后的状态)。
+        """
+        # 乱序保护(最高优先级):过时命令幂等忽略
+        if status_revision is not None and status_revision < state.last_status_revision:
             return Accepted(())
+        # 幂等:已是目标状态
         if state.status is target:
-            return Accepted(())  # 幂等
-        if state.status not in allowed:
+            return Accepted(())
+        # 终态保护:SUCCEEDED/FAILED/BLOCKED 不接受非幂等迁移
+        if state.status in (_S.SUCCEEDED, _S.FAILED, _S.BLOCKED):
+            if status_revision is not None:
+                return Accepted(())  # 终态后任何 revision 都幂等忽略
             return Rejected("bad_transition", f"{target} 不允许自 {state.status}")
+        # 必须已经过了 INPUTS_BOUND(spec 已记录)
+        if state.status is None or state.status is _S.INPUTS_BOUND:
+            if status_revision is not None:
+                return Accepted(())  # 尚未就绪,幂等忽略(PM 会重试)
+            return Rejected("bad_transition", f"{target} 不允许自 {state.status}")
+        # 在事件中记录 status_revision,以便 evolve 设置 last_status_revision
+        if status_revision is not None and hasattr(event, "model_copy"):
+            event = event.model_copy(update={"status_revision": status_revision})
         return Accepted((ProposedEvent(key, event),))
 
     def evolve(self, state: AttemptState, event: AttemptEvent) -> AttemptState:
@@ -302,35 +328,45 @@ class TaskAttemptDecider:
                 update={
                     "status": _S.WAITING_BUDGET,
                     "spec": event.spec,
-                    "provider_phase": state.provider_phase + 1,
+                    "last_status_revision": event.status_revision
+                    if event.status_revision is not None
+                    else state.last_status_revision + 1,
                 }
             )
         if isinstance(event, AttemptWaitingProviderEvt):
             return state.model_copy(
                 update={
                     "status": _S.WAITING_PROVIDER,
-                    "provider_phase": state.provider_phase + 1,
+                    "last_status_revision": event.status_revision
+                    if event.status_revision is not None
+                    else state.last_status_revision + 1,
                 }
             )
         if isinstance(event, AttemptWaitingReconciliationEvt):
             return state.model_copy(
                 update={
                     "status": _S.WAITING_RECONCILIATION,
-                    "provider_phase": state.provider_phase + 1,
+                    "last_status_revision": event.status_revision
+                    if event.status_revision is not None
+                    else state.last_status_revision + 1,
                 }
             )
         if isinstance(event, AttemptBlockedEvt):
             return state.model_copy(
                 update={
                     "status": _S.BLOCKED,
-                    "provider_phase": state.provider_phase + 1,
+                    "last_status_revision": event.status_revision
+                    if event.status_revision is not None
+                    else state.last_status_revision + 1,
                 }
             )
         if isinstance(event, AttemptFailedEvt):
             return state.model_copy(
                 update={
                     "status": _S.FAILED,
-                    "provider_phase": state.provider_phase + 1,
+                    "last_status_revision": event.status_revision
+                    if event.status_revision is not None
+                    else state.last_status_revision + 1,
                 }
             )
         if isinstance(event, ArtifactCandidateProducedEvt):

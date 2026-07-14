@@ -29,27 +29,27 @@ class RecordExecutionSpecCmd(MessagePayload):
 class MarkWaitingProviderCmd(MessagePayload):
     type: Literal["mark_waiting_provider"] = "mark_waiting_provider"
     attempt_id: str
-    min_provider_phase: int | None = None
+    status_revision: int | None = None
 
 
 class MarkWaitingReconciliationCmd(MessagePayload):
     type: Literal["mark_waiting_reconciliation"] = "mark_waiting_reconciliation"
     attempt_id: str
-    min_provider_phase: int | None = None
+    status_revision: int | None = None
 
 
 class MarkBlockedCmd(MessagePayload):
     type: Literal["mark_blocked"] = "mark_blocked"
     attempt_id: str
     reason: str
-    min_provider_phase: int | None = None
+    status_revision: int | None = None
 
 
 class MarkFailedCmd(MessagePayload):
     type: Literal["mark_failed"] = "mark_failed"
     attempt_id: str
     reason: str
-    min_provider_phase: int | None = None
+    status_revision: int | None = None
 
 
 class RecordProviderResultCmd(MessagePayload):
@@ -58,6 +58,7 @@ class RecordProviderResultCmd(MessagePayload):
     operation_id: str
     blob_ref: str
     payload: ArtifactPayload
+    status_revision: int | None = None
 
 
 AttemptCommand = (
@@ -80,28 +81,33 @@ class ProviderExecutionSpecRecordedEvt(MessagePayload):
     type: Literal["provider_execution_spec_recorded"] = "provider_execution_spec_recorded"
     attempt_id: str
     spec: ProviderExecutionSpec
+    status_revision: int | None = None
 
 
 class AttemptWaitingProviderEvt(MessagePayload):
     type: Literal["attempt_waiting_provider"] = "attempt_waiting_provider"
     attempt_id: str
+    status_revision: int | None = None
 
 
 class AttemptWaitingReconciliationEvt(MessagePayload):
     type: Literal["attempt_waiting_reconciliation"] = "attempt_waiting_reconciliation"
     attempt_id: str
+    status_revision: int | None = None
 
 
 class AttemptBlockedEvt(MessagePayload):
     type: Literal["attempt_blocked"] = "attempt_blocked"
     attempt_id: str
     reason: str
+    status_revision: int | None = None
 
 
 class AttemptFailedEvt(MessagePayload):
     type: Literal["attempt_failed"] = "attempt_failed"
     attempt_id: str
     reason: str
+    status_revision: int | None = None
 
 
 AttemptEvent = (

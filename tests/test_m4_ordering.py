@@ -1,10 +1,12 @@
-"""M4:异步乱序保护 — provider_phase 单调递增,过时命令幂等忽略。
+"""M4:异步乱序保护 — status_revision(causal event global_position)。
 
 证明:
-1. min_provider_phase < current_phase → Accepted(()) (幂等忽略,不拒绝/不回退)
-2. min_provider_phase == current_phase → 正常迁移(或被 allowed 集合拒绝)
-3. 无 min_provider_phase(None) → 向后兼容(不做 phase 校验)
-4. SchedulingPM 每次推进状态都递增 phase,不同事件顺序下收敛到正确终态
+1. status_revision < last_status_revision → Accepted(()) (幂等忽略过时命令)
+2. status_revision > last_status_revision → 允许跳过中间状态(新命令先到)
+3. 无 status_revision(None) → 向后兼容
+4. 3→2→1 顺序最终收敛到事实序列 3 对应状态
+5. UNKNOWN 先于 INITIATED 到达,不被永久拒绝
+6. Result 先于 WaitingProvider 到达,最终保持 SUCCEEDED
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any
 from studio.domain import ids as domain_ids
 from studio.domain.artifacts import (
     ArtifactRef,
+    ImagePayload,
     ImagePlanPayload,
     OperationParam,
     PlannedOperation,
@@ -24,11 +27,11 @@ from studio.kernel.decisions import Accepted
 from studio.production import identity
 from studio.production.attempt import TaskAttemptDecider
 from studio.production.attempt_payloads import (
-    MarkBlockedCmd,
     MarkFailedCmd,
     MarkWaitingProviderCmd,
     MarkWaitingReconciliationCmd,
     RecordExecutionSpecCmd,
+    RecordProviderResultCmd,
 )
 from studio.production.execution_spec import ProviderExecutionSpec
 from studio.production.payloads import CreateTaskAttemptCmd
@@ -85,7 +88,7 @@ def _spec(aid: str) -> ProviderExecutionSpec:
     )
 
 
-def _at_waiting_provider() -> tuple[TaskAttemptDecider, Any, str]:
+def _at_waiting_budget() -> tuple[TaskAttemptDecider, Any, str]:
     d = TaskAttemptDecider(golden_compiled(), {})
     binding = _plan_binding()
     aid = _image_attempt_id(binding)
@@ -96,9 +99,7 @@ def _at_waiting_provider() -> tuple[TaskAttemptDecider, Any, str]:
     )
     s, _ = _apply(d, d.initial_state(), cmd)
     s, _ = _apply(d, s, RecordExecutionSpecCmd(attempt_id=aid, spec=_spec(aid)))
-    # phase is now 1 (after WAITING_BUDGET)
-    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, min_provider_phase=1))
-    # phase is now 2
+    # Now at WAITING_BUDGET, last_status_revision set from spec event
     return d, s, aid
 
 
@@ -106,97 +107,100 @@ def _at_waiting_provider() -> tuple[TaskAttemptDecider, Any, str]:
 
 
 def test_stale_command_idempotent_ignored() -> None:
-    """phase=2(WAITING_PROVIDER), 收到 min_phase=1 的 MarkWaitingReconciliation -> 忽略。"""
-    d, s, aid = _at_waiting_provider()
-    assert s.provider_phase == 2
-    # 过时命令:phase=1 < current=2 -> 幂等忽略
-    s2, dec = _apply(
-        d, s, MarkWaitingReconciliationCmd(attempt_id=aid, min_provider_phase=1)
-    )
+    """revision=5 已设置;收到 revision=3 -> 幂等忽略。"""
+    d, s, aid = _at_waiting_budget()
+    # First move to WAITING_PROVIDER at revision=10
+    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 10
+    # Stale command: revision=5 < 10 -> ignored
+    s2, dec = _apply(d, s, MarkWaitingReconciliationCmd(attempt_id=aid, status_revision=5))
     assert isinstance(dec, Accepted) and dec.events == ()
-    assert s2.status is _S.WAITING_PROVIDER  # 状态未回退
+    assert s2.status is _S.WAITING_PROVIDER  # 未回退
 
 
-def test_current_phase_command_succeeds() -> None:
-    """phase=2(WAITING_PROVIDER), 收到 min_phase=2 的 MarkWaitingReconciliation -> 正常迁移。"""
-    d, s, aid = _at_waiting_provider()
-    s2, dec = _apply(
-        d, s, MarkWaitingReconciliationCmd(attempt_id=aid, min_provider_phase=2)
-    )
+def test_newer_command_skips_intermediate_states() -> None:
+    """revision=20 到达时当前 revision=1;允许跳过中间状态直接迁移。"""
+    d, s, aid = _at_waiting_budget()
+    # revision=1(from spec evolve); 收到 revision=20 的 MarkFailed -> 直接迁移
+    s2, dec = _apply(d, s, MarkFailedCmd(attempt_id=aid, reason="abort", status_revision=20))
     assert isinstance(dec, Accepted) and len(dec.events) == 1
-    assert s2.status is _S.WAITING_RECONCILIATION
-    assert s2.provider_phase == 3
+    assert s2.status is _S.FAILED and s2.last_status_revision == 20
 
 
-def test_no_phase_backward_compatible() -> None:
-    """min_provider_phase=None(legacy/M3) -> 不做 phase 校验,直接按 allowed 决定。"""
-    d, s, aid = _at_waiting_provider()
-    # None -> allowed 里有 WAITING_PROVIDER -> 正常
-    s2, dec = _apply(
-        d, s, MarkWaitingReconciliationCmd(attempt_id=aid, min_provider_phase=None)
-    )
+def test_no_revision_backward_compatible() -> None:
+    """status_revision=None -> 不做乱序校验。"""
+    d, s, aid = _at_waiting_budget()
+    s2, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=None))
     assert isinstance(dec, Accepted) and len(dec.events) == 1
-    assert s2.status is _S.WAITING_RECONCILIATION
-
-
-def test_stale_mark_failed_ignored() -> None:
-    """MarkFailed 的 stale 命令也被幂等忽略,不会永久拒绝。"""
-    d, s, aid = _at_waiting_provider()
-    s2, dec = _apply(d, s, MarkFailedCmd(attempt_id=aid, reason="old", min_provider_phase=0))
-    assert isinstance(dec, Accepted) and dec.events == ()
     assert s2.status is _S.WAITING_PROVIDER
 
 
-def test_phase_increments_through_lifecycle() -> None:
-    """完整生命周期:phase 单调递增,每次迁移 +1。"""
-    d = TaskAttemptDecider(golden_compiled(), {})
-    binding = _plan_binding()
-    aid = _image_attempt_id(binding)
-    cmd = CreateTaskAttemptCmd(
-        attempt_id=aid, project_id=_P, stage_id="image", partition_key=_PART,
-        output_key="image", series_id=domain_ids.series_id(_P, "image", _PART),
-        exact_refs=(binding,),
-    )
-    s, _ = _apply(d, d.initial_state(), cmd)
-    assert s.provider_phase == 0  # create 不增 phase
+def test_order_3_2_1_converges_to_state_3() -> None:
+    """事实顺序 INITIATED(1)→UNKNOWN(2)→SUBMITTED(3),命令 3→2→1 到达。
 
-    s, _ = _apply(d, s, RecordExecutionSpecCmd(attempt_id=aid, spec=_spec(aid)))
-    assert s.provider_phase == 1  # WAITING_BUDGET
-
-    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, min_provider_phase=1))
-    assert s.provider_phase == 2  # WAITING_PROVIDER
-
-    s, _ = _apply(d, s, MarkWaitingReconciliationCmd(attempt_id=aid, min_provider_phase=2))
-    assert s.provider_phase == 3  # WAITING_RECONCILIATION
-
-    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, min_provider_phase=3))
-    assert s.provider_phase == 4  # back to WAITING_PROVIDER
-
-    s, _ = _apply(d, s, MarkFailedCmd(attempt_id=aid, reason="fail", min_provider_phase=4))
-    assert s.provider_phase == 5  # FAILED
-    assert s.status is _S.FAILED
+    最终状态应该是 SUBMITTED 对应的 WAITING_PROVIDER(revision=3)。
+    """
+    d, s, aid = _at_waiting_budget()
+    # SUBMITTED arrives first (revision=30)
+    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=30))
+    assert s.status is _S.WAITING_PROVIDER and s.last_status_revision == 30
+    # UNKNOWN arrives second (revision=20) — stale, ignored
+    s, dec = _apply(d, s, MarkWaitingReconciliationCmd(attempt_id=aid, status_revision=20))
+    assert isinstance(dec, Accepted) and dec.events == ()
+    assert s.status is _S.WAITING_PROVIDER  # 未回退
+    # INITIATED arrives third (revision=10) — stale, ignored
+    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert isinstance(dec, Accepted) and dec.events == ()
+    assert s.status is _S.WAITING_PROVIDER
 
 
-def test_competing_commands_last_wins() -> None:
-    """模拟竞争:MarkBlocked(phase=1) vs MarkWaitingProvider(phase=1),先到者胜。"""
-    d = TaskAttemptDecider(golden_compiled(), {})
-    binding = _plan_binding()
-    aid = _image_attempt_id(binding)
-    cmd = CreateTaskAttemptCmd(
-        attempt_id=aid, project_id=_P, stage_id="image", partition_key=_PART,
-        output_key="image", series_id=domain_ids.series_id(_P, "image", _PART),
-        exact_refs=(binding,),
-    )
-    s, _ = _apply(d, d.initial_state(), cmd)
-    s, _ = _apply(d, s, RecordExecutionSpecCmd(attempt_id=aid, spec=_spec(aid)))
-    assert s.provider_phase == 1
+def test_unknown_before_initiated_not_rejected() -> None:
+    """UNKNOWN(revision=20) 先于 INITIATED(revision=10) 到达。
 
-    # MarkWaitingProvider 先到:成功,phase->2
-    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, min_provider_phase=1))
+    UNKNOWN 对应 WAITING_RECONCILIATION 应直接被接受(跳过 WAITING_PROVIDER)。
+    INITIATED 后到应被忽略。
+    """
+    d, s, aid = _at_waiting_budget()
+    # UNKNOWN arrives first: WAITING_BUDGET -> WAITING_RECONCILIATION
+    s, dec = _apply(d, s, MarkWaitingReconciliationCmd(attempt_id=aid, status_revision=20))
     assert isinstance(dec, Accepted) and len(dec.events) == 1
-    assert s.status is _S.WAITING_PROVIDER and s.provider_phase == 2
+    assert s.status is _S.WAITING_RECONCILIATION
+    # INITIATED arrives later (revision=10) -> stale, ignored
+    s, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert isinstance(dec, Accepted) and dec.events == ()
+    assert s.status is _S.WAITING_RECONCILIATION
 
-    # MarkBlocked 迟到:phase=1 < current=2 -> 幂等忽略,不永久 Rejected
-    s2, dec2 = _apply(d, s, MarkBlockedCmd(attempt_id=aid, reason="late", min_provider_phase=1))
+
+def test_result_before_waiting_provider_succeeds() -> None:
+    """RecordProviderResult(revision=30) 先于 WaitingProvider(revision=10) 到达。
+
+    Result 从 WAITING_BUDGET 被接受(status_revision 允许跳过中间状态);
+    后到的 WaitingProvider 被忽略,最终保持 SUCCEEDED。
+    """
+    d, s, aid = _at_waiting_budget()
+    spec = _spec(aid)
+    payload = ImagePayload(shot_id=_PART, prompt="p", blob_ref="blob://final")
+    # Result arrives first (revision=30)
+    s, dec = _apply(d, s, RecordProviderResultCmd(
+        attempt_id=aid, operation_id=spec.operation_id, blob_ref="blob://final",
+        payload=payload, status_revision=30,
+    ))
+    assert isinstance(dec, Accepted) and len(dec.events) == 1
+    assert s.status is _S.SUCCEEDED
+    # WaitingProvider arrives later (revision=10) -> terminal state, stale -> ignored
+    s2, dec2 = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
     assert isinstance(dec2, Accepted) and dec2.events == ()
-    assert s2.status is _S.WAITING_PROVIDER  # 未回退
+    assert s2.status is _S.SUCCEEDED
+
+
+def test_result_without_revision_from_waiting_budget_accepted() -> None:
+    """RecordProviderResult(None revision) 从 WAITING_BUDGET 也被接受(跳过中间)。"""
+    d, s, aid = _at_waiting_budget()
+    spec = _spec(aid)
+    payload = ImagePayload(shot_id=_PART, prompt="p", blob_ref="blob://final")
+    s, dec = _apply(d, s, RecordProviderResultCmd(
+        attempt_id=aid, operation_id=spec.operation_id, blob_ref="blob://final",
+        payload=payload, status_revision=None,
+    ))
+    assert isinstance(dec, Accepted) and len(dec.events) == 1
+    assert s.status is _S.SUCCEEDED
