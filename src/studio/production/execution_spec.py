@@ -1,8 +1,10 @@
 """ProviderExecutionSpec:副作用发生前作为事件数据落库的不可变执行规格 + 报价。
 
-携带 Plan 契约证据(plan_ref + 唯一 operation),使 AttemptDecider 能验证:
-plan_ref 属于该 Attempt 的输入、Plan 恰好一个 operation、logical_operation_key 来自该 operation、
-request_digest 与 operation 内容一致、operation_id 由 attempt+key 派生。
+携带完整 plan_payload,model_validator 强制 Plan 契约(直接构造也无法绕过):
+- digest(plan_payload) == plan_ref.digest(内容寻址一致)
+- Plan 恰好一个 operation
+- request_digest == digest(operation)、logical_operation_key == operation.key
+verify_membership 比较**完整 ArtifactRef**(不仅 artifact_id)。
 """
 
 from __future__ import annotations
@@ -25,10 +27,6 @@ def canon_money(value: Decimal) -> str:
     return format(Decimal(value).normalize(), "f")
 
 
-def _request_digest(operation: PlannedOperation) -> str:
-    return digest(operation.model_dump(mode="json"))
-
-
 class ProviderExecutionSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -37,7 +35,7 @@ class ProviderExecutionSpec(BaseModel):
     provider_id: str
     provider_version: str
     plan_ref: ArtifactRef
-    operation: PlannedOperation
+    plan_payload: ImagePlanPayload
     request_ref: str
     request_digest: Sha256Hex
     estimated_cost: NonNegativeMoney
@@ -46,11 +44,20 @@ class ProviderExecutionSpec(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> ProviderExecutionSpec:
-        if self.logical_operation_key != self.operation.logical_operation_key:
-            raise ValueError("logical_operation_key 必须来自 operation")
-        if self.request_digest != _request_digest(self.operation):
+        if digest(self.plan_payload) != self.plan_ref.digest:
+            raise ValueError("plan_payload 与 plan_ref.digest 不一致")
+        if len(self.plan_payload.operations) != 1:
+            raise ValueError("Plan 必须恰好一个 operation")
+        op = self.plan_payload.operations[0]
+        if self.logical_operation_key != op.logical_operation_key:
+            raise ValueError("logical_operation_key 必须来自唯一 operation")
+        if self.request_digest != digest(op):
             raise ValueError("request_digest 与 operation 内容不一致")
         return self
+
+    @property
+    def operation(self) -> PlannedOperation:
+        return self.plan_payload.operations[0]
 
     @property
     def operation_id(self) -> str:
@@ -70,8 +77,8 @@ class ProviderExecutionSpec(BaseModel):
         )
 
     def verify_membership(self, exact_refs: Iterable[BindingItem]) -> None:
-        """校验 plan_ref 确实是该 Attempt 的输入之一。"""
-        if not any(b.artifact_id == self.plan_ref.artifact_id for b in exact_refs):
+        """校验 plan_ref 完整引用确实是该 Attempt 的输入之一。"""
+        if not any(b.to_ref() == self.plan_ref for b in exact_refs):
             raise ValueError("plan_ref 不属于该 Attempt 的 exact_refs")
 
     @classmethod
@@ -88,7 +95,6 @@ class ProviderExecutionSpec(BaseModel):
         pricing_version: str,
         request_ref: str,
     ) -> ProviderExecutionSpec:
-        # Plan 必须恰好一个 operation(不默取第一项)
         if len(plan_payload.operations) != 1:
             raise ValueError("Plan 必须恰好一个 operation")
         op = plan_payload.operations[0]
@@ -98,9 +104,9 @@ class ProviderExecutionSpec(BaseModel):
             provider_id=provider_id,
             provider_version=provider_version,
             plan_ref=plan_ref,
-            operation=op,
+            plan_payload=plan_payload,
             request_ref=request_ref,
-            request_digest=_request_digest(op),
+            request_digest=digest(op),
             estimated_cost=estimated_cost,
             currency=currency,
             pricing_version=pricing_version,

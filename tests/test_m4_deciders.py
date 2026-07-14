@@ -1,4 +1,4 @@
-"""M4 步骤1-2:Budget / ProviderOperation 纯 Decider 的状态机穷举迁移测试。"""
+﻿"""M4 步骤1-2:Budget / ProviderOperation 纯 Decider 的状态机穷举迁移测试。"""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from studio.production.provider_op import (
     RecordSubmittedCmd,
     RecordSucceededCmd,
 )
+from studio.serialization import digest
 
 
 def _apply(decider: Any, state: Any, cmd: Any) -> tuple[Any, Any]:
@@ -67,7 +68,7 @@ def _init_budget(total: str = "100") -> tuple[BudgetDecider, Any]:
     return d, state
 
 
-def _reserve(op: str, amount: str, quote: str = "q1") -> ReserveBudgetCmd:
+def _reserve(op: str, amount: str, quote: str = "a" * 64) -> ReserveBudgetCmd:
     return ReserveBudgetCmd(
         project_id="p", operation_id=op, amount=Decimal(amount), currency="CNY",
         quote_digest=quote,
@@ -102,12 +103,12 @@ def test_budget_reserve_currency_mismatch_rejected() -> None:
     dec = d.decide(
         s,
         ReserveBudgetCmd(project_id="p", operation_id="op1", amount=Decimal(1),
-                         currency="USD", quote_digest="q"),
+                         currency="USD", quote_digest="a" * 64),
     )
     assert isinstance(dec, Rejected) and dec.code == "currency_mismatch"
 
 
-def _settle(op: str, actual: str, quote: str = "q1") -> SettleBudgetCmd:
+def _settle(op: str, actual: str, quote: str = "a" * 64) -> SettleBudgetCmd:
     return SettleBudgetCmd(
         project_id="p", operation_id=op, actual=Decimal(actual), currency="CNY",
         quote_digest=quote,
@@ -176,7 +177,9 @@ def test_budget_settle_unknown_reservation_rejected() -> None:
 def test_budget_release_uncharged() -> None:
     d, s = _init_budget("100")
     s, _ = _apply(d, s, _reserve("op1", "30"))
-    s, dec = _apply(d, s, ReleaseBudgetCmd(project_id="p", operation_id="op1", quote_digest="q1"))
+    s, dec = _apply(
+        d, s, ReleaseBudgetCmd(project_id="p", operation_id="op1", quote_digest="a" * 64)
+    )
     assert _event_types(dec) == ["budget_released", "budget_settlement_completed"]
     assert s.available == Decimal(100)  # 全额释放
 
@@ -214,17 +217,18 @@ def _plan_payload(op_key: str = "shot_01:image:v0") -> ImagePlanPayload:
     )
 
 
-def _plan_ref() -> ArtifactRef:
+def _plan_ref(payload: ImagePlanPayload) -> ArtifactRef:
     series = domain_ids.series_id("proj", "plan", "shot_01")
     return ArtifactRef(
         artifact_id=domain_ids.artifact_id(series, 1), series_id=series,
-        revision=1, digest="c" * 64,
+        revision=1, digest=digest(payload),
     )
 
 
 def _spec(op_key: str = "shot_01:image:v0", cost: str = "10") -> ProviderExecutionSpec:
+    payload = _plan_payload(op_key)
     return ProviderExecutionSpec.from_plan(
-        attempt_id="att-1", plan_ref=_plan_ref(), plan_payload=_plan_payload(op_key),
+        attempt_id="att-1", plan_ref=_plan_ref(payload), plan_payload=payload,
         provider_id="fake", provider_version="1", estimated_cost=Decimal(cost),
         currency="CNY", pricing_version="1", request_ref="req://1",
     )
@@ -237,6 +241,13 @@ def _op_id() -> str:
 
 def _result() -> ProviderResultRef:
     return ProviderResultRef(blob_ref="blob://x", digest="b" * 64)
+
+
+def _succ(op: str, event_id: str, cost: str = "10") -> RecordSucceededCmd:
+    return RecordSucceededCmd(
+        operation_id=op, result_ref=_result(), cost_actual=Decimal(cost),
+        cost_currency="CNY", provider_event_id=event_id,
+    )
 
 
 def _initiated() -> tuple[ProviderOperationDecider, Any]:
@@ -262,8 +273,7 @@ def test_provider_happy_path_transitions() -> None:
     assert s.status is ProviderOpStatus.SUBMITTED and s.job_id == "J1"
     s, _ = _apply(
         d, s,
-        RecordSucceededCmd(operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
-                           provider_event_id="e2"),
+        _succ(op, "e2"),
     )
     assert s.status is ProviderOpStatus.SUCCEEDED
 
@@ -294,22 +304,19 @@ def test_provider_webhook_dedup_and_terminal_conflict() -> None:
     s, _ = _apply(d, s, RecordSubmittedCmd(operation_id=op, job_id="J1", provider_event_id="e1"))
     s, _ = _apply(
         d, s,
-        RecordSucceededCmd(operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
-                           provider_event_id="e2"),
+        _succ(op, "e2"),
     )
     # 重复 webhook(同 provider_event_id)-> 去重空
     _, dec = _apply(
         d, s,
-        RecordSucceededCmd(operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
-                           provider_event_id="e2"),
+        _succ(op, "e2"),
     )
     assert isinstance(dec, Accepted) and dec.events == ()
     # 同终态不同 cost -> 冲突
     with pytest.raises(IdempotencyConflict):
         d.decide(
             s,
-            RecordSucceededCmd(operation_id=op, result_ref=_result(), cost_actual=Decimal(99),
-                               provider_event_id="e3"),
+            _succ(op, "e3", cost="99"),
         )
 
 
@@ -322,8 +329,10 @@ def test_provider_submission_unknown_parked_then_reconciled() -> None:
     # 人工/对账恢复到 SUCCEEDED
     s, dec = _apply(
         d, s,
-        ReconcileSucceededCmd(operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
-                              authority_ref="ops-1"),
+        ReconcileSucceededCmd(
+            operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
+            cost_currency="CNY", authority_ref="ops-1",
+        ),
     )
     assert s.status is ProviderOpStatus.SUCCEEDED
     assert _event_types(dec) == ["provider_op_succeeded"]
@@ -336,7 +345,7 @@ def test_provider_failed_from_submitted() -> None:
     s, _ = _apply(d, s, RecordSubmittedCmd(operation_id=op, job_id="J1", provider_event_id="e1"))
     s, _ = _apply(
         d, s,
-        RecordFailedCmd(operation_id=op, charged=True, cost_actual=Decimal(10),
+        RecordFailedCmd(operation_id=op, charged=True, cost_actual=Decimal(10), cost_currency="CNY",
                         provider_event_id="e2"),
     )
     assert s.status is ProviderOpStatus.FAILED and s.charged is True
@@ -397,7 +406,8 @@ def test_provider_uncharged_failure_with_nonzero_actual_rejected() -> None:
     dec = d.decide(
         s,
         RecordFailedCmd(
-            operation_id=op, charged=False, cost_actual=Decimal(5), provider_event_id="e2"
+            operation_id=op, charged=False, cost_actual=Decimal(5),
+            cost_currency="CNY", provider_event_id="e2",
         ),
     )
     assert isinstance(dec, Rejected) and dec.code == "charged_cost_mismatch"
@@ -412,7 +422,7 @@ def test_execution_spec_requires_exactly_one_operation() -> None:
     )
     with pytest.raises(ValueError, match="恰好一个"):
         ProviderExecutionSpec.from_plan(
-            attempt_id="att-1", plan_ref=_plan_ref(), plan_payload=two_ops,
+            attempt_id="att-1", plan_ref=_plan_ref(two_ops), plan_payload=two_ops,
             provider_id="fake", provider_version="1", estimated_cost=Decimal(10),
             currency="CNY", pricing_version="1", request_ref="req://1",
         )
@@ -425,7 +435,7 @@ def test_execution_spec_membership_check() -> None:
     spec = _spec()
     good = BindingItem.from_ref(
         requirement_key="plan", logical_slot="plan", partition_key="shot_01",
-        ref=_plan_ref(), propagation_mode=PropagationMode.PARTITION_PRESERVING,
+        ref=spec.plan_ref, propagation_mode=PropagationMode.PARTITION_PRESERVING,
     )
     spec.verify_membership((good,))  # 不抛
     other_series = domain_ids.series_id("proj", "plan", "shot_99")
@@ -451,27 +461,27 @@ def test_budget_wrong_project_rejected() -> None:
     dec = d.decide(
         s,
         ReserveBudgetCmd(project_id="other", operation_id="op1", amount=Decimal(1),
-                         currency="CNY", quote_digest="q1"),
+                         currency="CNY", quote_digest="a" * 64),
     )
     assert isinstance(dec, Rejected) and dec.code == "wrong_project"
 
 
 def test_budget_release_wrong_quote_conflict() -> None:
     d, s = _init_budget("100")
-    s, _ = _apply(d, s, _reserve("op1", "30", quote="q1"))
+    s, _ = _apply(d, s, _reserve("op1", "30", quote="a" * 64))
     with pytest.raises(IdempotencyConflict):
-        d.decide(s, ReleaseBudgetCmd(project_id="p", operation_id="op1", quote_digest="WRONG"))
+        d.decide(s, ReleaseBudgetCmd(project_id="p", operation_id="op1", quote_digest="b" * 64))
 
 
 def test_budget_reserve_same_op_different_currency_conflict() -> None:
     d, s = _init_budget("100")
-    s, _ = _apply(d, s, _reserve("op1", "30", quote="q1"))
+    s, _ = _apply(d, s, _reserve("op1", "30", quote="a" * 64))
     # 同 op 换币种 -> 幂等冲突(而非 currency rejection)
     with pytest.raises(IdempotencyConflict):
         d.decide(
             s,
             ReserveBudgetCmd(project_id="p", operation_id="op1", amount=Decimal(30),
-                             currency="USD", quote_digest="q1"),
+                             currency="USD", quote_digest="a" * 64),
         )
 
 
@@ -480,3 +490,99 @@ def test_budget_adjustment_same_entry_different_payload_conflict() -> None:
     s, _ = _apply(d, s, _adjust("e1", LedgerDirection.CREDIT, "50"))
     with pytest.raises(IdempotencyConflict):
         d.decide(s, _adjust("e1", LedgerDirection.DEBIT, "50"))
+
+
+
+
+# --------------------------------------------------------------------------- #
+# 对抗:Plan 契约不可绕过 + 币种端到端指纹
+# --------------------------------------------------------------------------- #
+
+
+def test_spec_direct_construction_cannot_bypass_multi_operation() -> None:
+    from pydantic import ValidationError
+
+    two_ops = ImagePlanPayload(
+        operations=(
+            PlannedOperation(logical_operation_key="a", op_type="gen", params=()),
+            PlannedOperation(logical_operation_key="b", op_type="gen", params=()),
+        )
+    )
+    ref = _plan_ref(two_ops)
+    with pytest.raises(ValidationError):
+        ProviderExecutionSpec(
+            attempt_id="att-1", logical_operation_key="a", provider_id="fake",
+            provider_version="1", plan_ref=ref, plan_payload=two_ops,
+            request_ref="r", request_digest=digest(two_ops.operations[0]),
+            estimated_cost=Decimal(10), currency="CNY", pricing_version="1",
+        )
+
+
+def test_spec_plan_payload_digest_must_equal_plan_ref() -> None:
+    from pydantic import ValidationError
+
+    payload = _plan_payload()
+    series = domain_ids.series_id("proj", "plan", "shot_01")
+    wrong_ref = ArtifactRef(
+        artifact_id=domain_ids.artifact_id(series, 1), series_id=series,
+        revision=1, digest="d" * 64,  # 与 payload 摘要不符
+    )
+    with pytest.raises(ValidationError):
+        ProviderExecutionSpec(
+            attempt_id="att-1", logical_operation_key=payload.operations[0].logical_operation_key,
+            provider_id="fake", provider_version="1", plan_ref=wrong_ref, plan_payload=payload,
+            request_ref="r", request_digest=digest(payload.operations[0]),
+            estimated_cost=Decimal(10), currency="CNY", pricing_version="1",
+        )
+
+
+def test_membership_requires_full_artifact_ref_equality() -> None:
+    from studio.domain.enums import PropagationMode
+    from studio.production.values import BindingItem
+
+    spec = _spec()
+    # 同 artifact_id、伪造 digest -> to_ref() != plan_ref -> 拒绝
+    forged = spec.plan_ref.model_copy(update={"digest": "f" * 64})
+    binding = BindingItem.from_ref(
+        requirement_key="plan", logical_slot="plan", partition_key="shot_01",
+        ref=forged, propagation_mode=PropagationMode.PARTITION_PRESERVING,
+    )
+    with pytest.raises(ValueError, match="不属于"):
+        spec.verify_membership((binding,))
+
+
+def test_non_sha_quote_digest_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ReserveBudgetCmd(
+            project_id="p", operation_id="op1", amount=Decimal(1), currency="CNY",
+            quote_digest="not-a-sha",
+        )
+
+
+def test_budget_settle_same_op_different_currency_conflict() -> None:
+    d, s = _init_budget("100")
+    s, _ = _apply(d, s, _reserve("op1", "30"))
+    with pytest.raises(IdempotencyConflict):
+        d.decide(
+            s,
+            SettleBudgetCmd(project_id="p", operation_id="op1", actual=Decimal(30),
+                            currency="USD", quote_digest="a" * 64),
+        )
+
+
+def test_provider_cost_currency_must_match_spec() -> None:
+    d, s = _initiated()
+    op = _op_id()
+    s, _ = _apply(d, s, ClaimSubmissionCmd(operation_id=op))
+    s, _ = _apply(d, s, RecordSubmittedCmd(operation_id=op, job_id="J1", provider_event_id="e1"))
+    dec = d.decide(
+        s,
+        RecordSucceededCmd(
+            operation_id=op, result_ref=_result(), cost_actual=Decimal(10),
+            cost_currency="USD", provider_event_id="e2",
+        ),
+    )
+    assert isinstance(dec, Rejected) and dec.code == "currency_mismatch"
+

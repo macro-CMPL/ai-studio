@@ -16,7 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from studio.domain._base import NonNegativeMoney, Sha256Hex
+from studio.domain._base import Currency, NonNegativeMoney, Sha256Hex
 from studio.domain.enums import ProviderOpStatus
 from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
 from studio.kernel.envelopes import MessagePayload
@@ -60,6 +60,7 @@ class RecordSucceededCmd(MessagePayload):
     operation_id: str
     result_ref: ProviderResultRef
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     provider_event_id: str
 
 
@@ -68,6 +69,7 @@ class RecordFailedCmd(MessagePayload):
     operation_id: str
     charged: bool
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     provider_event_id: str
 
 
@@ -95,6 +97,7 @@ class ReconcileSucceededCmd(MessagePayload):
     operation_id: str
     result_ref: ProviderResultRef
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     authority_ref: str
 
 
@@ -103,6 +106,7 @@ class ReconcileFailedCmd(MessagePayload):
     operation_id: str
     charged: bool
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     authority_ref: str
 
 
@@ -148,6 +152,7 @@ class ProviderOperationSucceededEvt(MessagePayload):
     operation_id: str
     result_ref: ProviderResultRef
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     provider_event_id: str
 
 
@@ -156,6 +161,7 @@ class ProviderOperationFailedEvt(MessagePayload):
     operation_id: str
     charged: bool
     cost_actual: NonNegativeMoney
+    cost_currency: Currency
     provider_event_id: str
 
 
@@ -343,6 +349,8 @@ class ProviderOperationDecider:
     def _succeeded(
         self, state: ProviderOpState, cmd: RecordSucceededCmd | ReconcileSucceededCmd
     ) -> Accepted[ProviderOpEvent] | Rejected:
+        if state.spec is not None and cmd.cost_currency != state.spec.currency:
+            return Rejected("currency_mismatch", "cost_currency 与 spec 不一致")
         event_id = (
             cmd.provider_event_id
             if isinstance(cmd, RecordSucceededCmd)
@@ -353,6 +361,7 @@ class ProviderOperationDecider:
                 "kind": "succeeded",
                 "result": cmd.result_ref.model_dump(mode="json"),
                 "cost": canon_money(cmd.cost_actual),
+                "currency": cmd.cost_currency,
             }
         )
         if self._dedup(state, event_id, fingerprint):
@@ -371,7 +380,8 @@ class ProviderOperationDecider:
                     "succeeded",
                     ProviderOperationSucceededEvt(
                         operation_id=cmd.operation_id, result_ref=cmd.result_ref,
-                        cost_actual=cmd.cost_actual, provider_event_id=event_id,
+                        cost_actual=cmd.cost_actual, cost_currency=cmd.cost_currency,
+                        provider_event_id=event_id,
                     ),
                 ),
             )
@@ -382,13 +392,20 @@ class ProviderOperationDecider:
     ) -> Accepted[ProviderOpEvent] | Rejected:
         if not cmd.charged and cmd.cost_actual != Decimal(0):
             return Rejected("charged_cost_mismatch", "charged=False 时 cost_actual 必须为 0")
+        if state.spec is not None and cmd.cost_currency != state.spec.currency:
+            return Rejected("currency_mismatch", "cost_currency 与 spec 不一致")
         event_id = (
             cmd.provider_event_id
             if isinstance(cmd, RecordFailedCmd)
             else f"reconcile:{cmd.authority_ref}"
         )
         fingerprint = digest(
-            {"kind": "failed", "charged": cmd.charged, "cost": canon_money(cmd.cost_actual)}
+            {
+                "kind": "failed",
+                "charged": cmd.charged,
+                "cost": canon_money(cmd.cost_actual),
+                "currency": cmd.cost_currency,
+            }
         )
         if self._dedup(state, event_id, fingerprint):
             return Accepted(())
@@ -406,7 +423,8 @@ class ProviderOperationDecider:
                     "failed",
                     ProviderOperationFailedEvt(
                         operation_id=cmd.operation_id, charged=cmd.charged,
-                        cost_actual=cmd.cost_actual, provider_event_id=event_id,
+                        cost_actual=cmd.cost_actual, cost_currency=cmd.cost_currency,
+                        provider_event_id=event_id,
                     ),
                 ),
             )
@@ -472,6 +490,7 @@ class ProviderOperationDecider:
                                     "kind": "succeeded",
                                     "result": event.result_ref.model_dump(mode="json"),
                                     "cost": canon_money(event.cost_actual),
+                                    "currency": event.cost_currency,
                                 }
                             ),
                         ),
@@ -493,6 +512,7 @@ class ProviderOperationDecider:
                                     "kind": "failed",
                                     "charged": event.charged,
                                     "cost": canon_money(event.cost_actual),
+                                    "currency": event.cost_currency,
                                 }
                             ),
                         ),

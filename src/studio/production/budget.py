@@ -1,4 +1,4 @@
-"""BudgetDecider(budget:{project} 流):强预算不变式的串行化点(不分片)。
+﻿"""BudgetDecider(budget:{project} 流):强预算不变式的串行化点(不分片)。
 
 - reserve/settle 均以 operation_id 幂等;同 op 异金额/币种/quote_digest -> IdempotencyConflict。
 - SettleBudget 原子产出 CAPTURE (+RELEASE 差额) (+OVERRUN) + BudgetSettlementCompleted(始终最后)。
@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from studio.domain._base import Currency, NonBlank, NonNegativeMoney
+from studio.domain._base import Currency, NonBlank, NonNegativeMoney, Sha256Hex
 from studio.domain.enums import LedgerDirection
 from studio.kernel.decisions import Accepted, ProposedEvent, Rejected
 from studio.kernel.envelopes import MessagePayload
@@ -37,7 +37,7 @@ class ReserveBudgetCmd(MessagePayload):
     operation_id: str
     amount: NonNegativeMoney
     currency: Currency
-    quote_digest: str
+    quote_digest: Sha256Hex
 
 
 class SettleBudgetCmd(MessagePayload):
@@ -46,14 +46,14 @@ class SettleBudgetCmd(MessagePayload):
     operation_id: str
     actual: NonNegativeMoney
     currency: Currency
-    quote_digest: str
+    quote_digest: Sha256Hex
 
 
 class ReleaseBudgetCmd(MessagePayload):
     type: Literal["release_budget"] = "release_budget"
     project_id: str
     operation_id: str
-    quote_digest: str
+    quote_digest: Sha256Hex
 
 
 class AdjustBudgetCmd(MessagePayload):
@@ -88,7 +88,7 @@ class BudgetReservedEvt(MessagePayload):
     operation_id: str
     amount: NonNegativeMoney
     currency: Currency
-    quote_digest: str
+    quote_digest: Sha256Hex
 
 
 class BudgetReservationDeclinedEvt(MessagePayload):
@@ -125,7 +125,8 @@ class BudgetSettlementCompletedEvt(MessagePayload):
     operation_id: str
     outcome: Literal["captured", "released"]
     captured_amount: NonNegativeMoney
-    quote_digest: str
+    currency: Currency
+    quote_digest: Sha256Hex
 
 
 class BudgetAdjustedEvt(MessagePayload):
@@ -160,14 +161,15 @@ class Reservation(BaseModel):
     operation_id: str
     amount: Decimal
     currency: str
-    quote_digest: str
+    quote_digest: Sha256Hex
 
 
 class Settlement(BaseModel):
     model_config = ConfigDict(frozen=True)
     operation_id: str
     captured_amount: Decimal
-    quote_digest: str
+    currency: str
+    quote_digest: Sha256Hex
     outcome: Literal["captured", "released"]
 
 
@@ -314,18 +316,23 @@ class BudgetDecider:
     def _settle(
         self, state: BudgetState, cmd: SettleBudgetCmd
     ) -> Accepted[BudgetEvent] | Rejected:
-        if (bad := self._check_currency(state, cmd.currency)) is not None:
-            return bad
+        if not state.initialized:
+            return Rejected("not_initialized", "预算未初始化")
         done = state.settlement(cmd.operation_id)
         if done is not None:
-            if done.captured_amount == cmd.actual and done.quote_digest == cmd.quote_digest:
+            if (
+                done.captured_amount == cmd.actual
+                and done.currency == cmd.currency
+                and done.quote_digest == cmd.quote_digest
+            ):
                 return Accepted(())  # 幂等
-            raise IdempotencyConflict(cmd.operation_id, "settle 金额/quote 不一致")
+            raise IdempotencyConflict(cmd.operation_id, "settle 金额/币种/quote 不一致")
         reservation = state.reservation(cmd.operation_id)
         if reservation is None:
             return Rejected("unknown_reservation", "无对应预留")
-        if reservation.quote_digest != cmd.quote_digest:
-            raise IdempotencyConflict(cmd.operation_id, "settle quote 与 reserve 不一致")
+        # 有预留时,币种/quote 与预留不同属于幂等冲突(而非普通 currency rejection)
+        if reservation.currency != cmd.currency or reservation.quote_digest != cmd.quote_digest:
+            raise IdempotencyConflict(cmd.operation_id, "settle 币种/quote 与 reserve 不一致")
 
         events: list[ProposedEvent[BudgetEvent]] = [
             ProposedEvent(
@@ -364,6 +371,7 @@ class BudgetDecider:
                     operation_id=cmd.operation_id,
                     outcome="captured",
                     captured_amount=cmd.actual,
+                    currency=cmd.currency,
                     quote_digest=cmd.quote_digest,
                 ),
             )
@@ -402,6 +410,7 @@ class BudgetDecider:
                         operation_id=cmd.operation_id,
                         outcome="released",
                         captured_amount=Decimal(0),
+                        currency=state.currency,
                         quote_digest=cmd.quote_digest,
                     ),
                 ),
@@ -477,6 +486,7 @@ class BudgetDecider:
                         Settlement(
                             operation_id=event.operation_id,
                             captured_amount=event.captured_amount,
+                            currency=event.currency,
                             quote_digest=event.quote_digest,
                             outcome=event.outcome,
                         ),
@@ -525,3 +535,4 @@ def _adjust_fingerprint_evt(evt: BudgetAdjustedEvt) -> str:
             "authority_ref": evt.authority_ref,
         }
     )
+
