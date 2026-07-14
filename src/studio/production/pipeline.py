@@ -32,81 +32,109 @@ from .compile import CompiledPipelineSpec, compile_from
 PartitionSelector = Callable[[Any], tuple[str, ...]]
 
 
-def golden_stagespecs() -> tuple[StageSpec, ...]:
-    return (
-        StageSpec(
-            stage_id="storyboard",
-            executor_kind=ExecutorKind.AGENT,
-            control_role=ControlRole.PRODUCER,
-            allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
-            cost_mode=CostMode.FREE,
-            requires=(),
-            produces=(
-                OutputSpec(
-                    artifact_type=ArtifactType.STORYBOARD,
-                    logical_slot="storyboard",
-                    schema_version=1,
-                    partitioning=Partitioning(kind=PartitioningKind.SINGLETON),
-                ),
+def _storyboard_stage() -> StageSpec:
+    return StageSpec(
+        stage_id="storyboard",
+        executor_kind=ExecutorKind.AGENT,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        requires=(),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.STORYBOARD,
+                logical_slot="storyboard",
+                schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.SINGLETON),
             ),
         ),
-        StageSpec(
-            stage_id="plan",
-            executor_kind=ExecutorKind.AGENT,
-            control_role=ControlRole.PRODUCER,
-            allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
-            cost_mode=CostMode.FREE,
-            requires=(
-                Requirement(
-                    artifact_type=ArtifactType.STORYBOARD,
-                    logical_slot="storyboard",
-                    cardinality=Cardinality(
-                        kind=CardinalityKind.DYNAMIC_PARTITION_BY, partition_by="shot_id"
-                    ),
-                    propagation_mode=PropagationMode.AGGREGATE,
-                    partition_selector_id="storyboard_shots",
-                    partition_selector_version="1",
+    )
+
+
+def _plan_stage() -> StageSpec:
+    return StageSpec(
+        stage_id="plan",
+        executor_kind=ExecutorKind.AGENT,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.STORYBOARD,
+                logical_slot="storyboard",
+                cardinality=Cardinality(
+                    kind=CardinalityKind.DYNAMIC_PARTITION_BY, partition_by="shot_id"
                 ),
-            ),
-            produces=(
-                OutputSpec(
-                    artifact_type=ArtifactType.IMAGE_PLAN,
-                    logical_slot="plan",
-                    schema_version=1,
-                    partitioning=Partitioning(
-                        kind=PartitioningKind.DYNAMIC_FROM, from_key="shot_id"
-                    ),
-                ),
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="storyboard_shots",
+                partition_selector_version="1",
             ),
         ),
-        StageSpec(
-            stage_id="image",
-            executor_kind=ExecutorKind.PROVIDER,
-            control_role=ControlRole.PRODUCER,
-            allowed_tool_effects=frozenset({ToolEffectLevel.COSTED}),
-            cost_mode=CostMode.METERED,
-            requires=(
-                Requirement(
-                    artifact_type=ArtifactType.IMAGE_PLAN,
-                    logical_slot="plan",
-                    cardinality=Cardinality(kind=CardinalityKind.STATIC),
-                    propagation_mode=PropagationMode.PARTITION_PRESERVING,
-                ),
-            ),
-            produces=(
-                OutputSpec(
-                    artifact_type=ArtifactType.IMAGE,
-                    logical_slot="image",
-                    schema_version=1,
-                    partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE_PLAN,
+                logical_slot="plan",
+                schema_version=1,
+                partitioning=Partitioning(
+                    kind=PartitioningKind.DYNAMIC_FROM, from_key="shot_id"
                 ),
             ),
         ),
     )
 
 
+def _image_stage(
+    executor_kind: ExecutorKind, cost_mode: CostMode, tool_effect: ToolEffectLevel
+) -> StageSpec:
+    return StageSpec(
+        stage_id="image",
+        executor_kind=executor_kind,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({tool_effect}),
+        cost_mode=cost_mode,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.IMAGE_PLAN,
+                logical_slot="plan",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE,
+                logical_slot="image",
+                schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+
+
+def golden_stagespecs() -> tuple[StageSpec, ...]:
+    """M4 Golden:image 是付费 PROVIDER stage(异步)。"""
+    return (
+        _storyboard_stage(),
+        _plan_stage(),
+        _image_stage(ExecutorKind.PROVIDER, CostMode.METERED, ToolEffectLevel.COSTED),
+    )
+
+
+def m3_stagespecs() -> tuple[StageSpec, ...]:
+    """M3 编排测试:image 是本地 TRANSFORM leaf(可同步产出),不涉及付费 provider。"""
+    return (
+        _storyboard_stage(),
+        _plan_stage(),
+        _image_stage(ExecutorKind.TRANSFORM, CostMode.FREE, ToolEffectLevel.PURE),
+    )
+
+
 def golden_compiled() -> CompiledPipelineSpec:
     return compile_from(golden_stagespecs())
+
+
+def m3_compiled() -> CompiledPipelineSpec:
+    return compile_from(m3_stagespecs())
 
 
 def _storyboard_shots(payload: Any) -> tuple[str, ...]:

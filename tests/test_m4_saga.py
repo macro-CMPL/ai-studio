@@ -22,6 +22,7 @@ from studio.production.attempt_payloads import (
     MarkBlockedCmd,
     MarkFailedCmd,
     MarkWaitingProviderCmd,
+    MarkWaitingReconciliationCmd,
     ProviderExecutionSpecRecordedEvt,
     RecordProviderResultCmd,
 )
@@ -41,6 +42,8 @@ from studio.production.provider_op import (
     ProviderOperationAbortedEvt,
     ProviderOperationFailedEvt,
     ProviderOperationInitiatedEvt,
+    ProviderOperationSubmissionUnknownEvt,
+    ProviderOperationSubmittedEvt,
     ProviderOperationSucceededEvt,
     ProviderResultRef,
 )
@@ -172,6 +175,81 @@ def test_scheduling_no_waiting_before_initiated() -> None:
     assert len(_of(cmds, InitiateProviderOpCmd)) == 1
 
 
+def test_scheduling_forged_reservation_raises() -> None:
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    # 预留金额与 spec 不符 -> ContractViolation,绝不 Initiate
+    with pytest.raises(ContractViolation):
+        _run(
+            ProviderSchedulingProcessManager(),
+            [
+                _created(),
+                ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+                BudgetReservedEvt(
+                    operation_id=op, amount=Decimal("0.01"), currency="CNY",
+                    quote_digest=spec.quote_digest(),
+                ),
+            ],
+        )
+
+
+def test_scheduling_initiated_without_reservation_no_waiting() -> None:
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    cmds = _run(
+        ProviderSchedulingProcessManager(),
+        [
+            _created(),
+            ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+            ProviderOperationInitiatedEvt(operation_id=op, spec=spec),  # 无已确认预留
+        ],
+    )
+    assert not _of(cmds, MarkWaitingProviderCmd)  # 预留未确认不推进
+
+
+def test_scheduling_unknown_and_submitted_transitions() -> None:
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    cmds = _run(
+        ProviderSchedulingProcessManager(),
+        [
+            _created(),
+            ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+            BudgetReservedEvt(
+                operation_id=op, amount=spec.estimated_cost, currency="CNY",
+                quote_digest=spec.quote_digest(),
+            ),
+            ProviderOperationSubmissionUnknownEvt(operation_id=op, reason="timeout"),
+            ProviderOperationSubmittedEvt(
+                operation_id=op, job_id="j", provider_event_id="pe"
+            ),
+        ],
+    )
+    assert len(_of(cmds, MarkWaitingReconciliationCmd)) == 1
+    assert len(_of(cmds, MarkWaitingProviderCmd)) == 1  # submitted 恢复
+
+
+def test_scheduling_declined_mismatch_ignored() -> None:
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    cmds = _run(
+        ProviderSchedulingProcessManager(),
+        [
+            _created(),
+            ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+            BudgetReservationDeclinedEvt(
+                operation_id=op, amount=spec.estimated_cost, available=Decimal(0),
+                currency="CNY", quote_digest="f" * 64,  # quote 不符
+            ),
+        ],
+    )
+    assert not _of(cmds, MarkBlockedCmd)  # 错配 decline 不阻塞
+
+
 def test_scheduling_declined_blocks() -> None:
     aid = _image_attempt_id()
     spec = _spec(aid)
@@ -183,7 +261,7 @@ def test_scheduling_declined_blocks() -> None:
             ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
             BudgetReservationDeclinedEvt(
                 operation_id=op, amount=spec.estimated_cost, available=Decimal(0),
-                currency="CNY",
+                currency="CNY", quote_digest=spec.quote_digest(),
             ),
         ],
     )

@@ -272,3 +272,61 @@ def test_result_bad_transition_from_inputs_bound() -> None:
         ),
     )
     assert isinstance(dec, Rejected) and dec.code == "bad_transition"
+
+
+# --- Blocker 1:PROVIDER 副作用边界封死 --- #
+
+
+def test_provider_stage_rejects_registered_executor() -> None:
+    # 误在 PROVIDER stage 注册同步 executor -> 构造期 fail-fast
+    with pytest.raises(ValueError, match="PROVIDER"):
+        TaskAttemptDecider(
+            golden_compiled(),
+            {"image": lambda stage, refs, part: ImagePayload(
+                shot_id="", prompt="p", blob_ref="b"
+            )},
+        )
+
+
+def test_create_rejects_forged_output_key() -> None:
+    d = _provider_decider()
+    binding = _plan_binding()
+    forged = CreateTaskAttemptCmd(
+        attempt_id=_image_attempt_id(binding), project_id=_PROJECT, stage_id="image",
+        partition_key=_PART, output_key="wrong",  # 伪造 output_key
+        series_id=domain_ids.series_id(_PROJECT, "wrong", _PART),  # 与伪造 key 自洽
+        exact_refs=(binding,),
+    )
+    dec = d.decide(d.initial_state(), forged)
+    assert isinstance(dec, Rejected) and dec.code == "output_key_mismatch"
+
+
+def test_owner_check_rejects_wrong_attempt_id() -> None:
+    d = _provider_decider()
+    cmd = _create_image_cmd()
+    s, _ = _apply(d, d.initial_state(), cmd)  # 已创建,owner 锁定
+    dec = d.decide(s, MarkWaitingProviderCmd(attempt_id="forged-attempt"))
+    assert isinstance(dec, Rejected) and dec.code == "wrong_attempt"
+
+
+def test_succeeded_forged_operation_not_falsely_idempotent() -> None:
+    d, s, aid = _image_at_waiting_provider()
+    spec = _spec(aid)
+    payload = ImagePayload(shot_id=_PART, prompt="p", blob_ref="blob://final")
+    s, _ = _apply(
+        d, s,
+        RecordProviderResultCmd(
+            attempt_id=aid, operation_id=spec.operation_id, blob_ref="blob://final",
+            payload=payload,
+        ),
+    )
+    assert s.status is _S.SUCCEEDED
+    # SUCCEEDED 后:伪造 operation_id + 相同 payload,必须先被 operation 校验拦下(非幂等成功)
+    dec = d.decide(
+        s,
+        RecordProviderResultCmd(
+            attempt_id=aid, operation_id="forged-op", blob_ref="blob://final",
+            payload=payload,
+        ),
+    )
+    assert isinstance(dec, Rejected) and dec.code == "operation_mismatch"

@@ -34,7 +34,17 @@ from studio.production.payloads import (
     ProductionCommand,
     ProposeArtifactVersionCmd,
 )
-from studio.production.pipeline import golden_compiled, golden_selectors
+
+__all__ = [
+    "ProductionStack",
+    "build_production_stack",
+    "init_command",
+    "supersede_plan_command",
+    "_storyboard_exec",
+    "_plan_exec",
+    "_image_exec",
+]
+from studio.production.pipeline import golden_selectors, m3_compiled
 from studio.production.process_managers import (
     ExpansionProcessManager,
     LineageProcessManager,
@@ -101,8 +111,9 @@ def build_production_stack() -> ProductionStack:
 
     deciders = {
         "project": ProjectDecider(),
+        # M3 栈:image 是 TRANSFORM leaf,可同步产出(不违反 PROVIDER 异步边界)。
         "attempt": TaskAttemptDecider(
-            golden_compiled(),
+            m3_compiled(),
             {
                 "storyboard": _storyboard_exec,
                 "plan": _plan_exec,
@@ -123,7 +134,7 @@ def build_production_stack() -> ProductionStack:
         EventPump(process_manager=PublishProcessManager(), uow_factory=factory, clock=clock),
         EventPump(
             process_manager=ExpansionProcessManager(
-                golden_compiled(), golden_selectors()
+                m3_compiled(), golden_selectors()
             ),
             uow_factory=factory,
             clock=clock,
@@ -150,7 +161,7 @@ def init_command(
         causation_id=None,
         issued_at=_ISSUED_AT,
         payload=InitializePipelineCmd(
-            project_id=project_id, pipeline_spec_id=golden_compiled().spec_id
+            project_id=project_id, pipeline_spec_id=m3_compiled().spec_id
         ),
     )
 

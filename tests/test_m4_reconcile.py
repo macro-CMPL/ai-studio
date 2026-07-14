@@ -99,7 +99,9 @@ def _reserved(spec: ProviderExecutionSpec) -> BudgetReservedEvt:
 
 
 def _tick(as_of: datetime, seq: int) -> ReconciliationTickEvt:
-    return ReconciliationTickEvt(scope="g", as_of=as_of, policy_version="1", sequence=seq)
+    return ReconciliationTickEvt(
+        scope="global", as_of=as_of, policy_version="1", sequence=seq
+    )
 
 
 def _run(pm: Any, payloads: list[MessagePayload]) -> list[Any]:
@@ -224,6 +226,37 @@ def test_reconciler_recycles_stuck_initiated() -> None:
     assert len(_of(cmds, AbortBeforeSubmissionCmd)) == 1
 
 
+def test_reconciler_ignores_foreign_scope() -> None:
+    spec = _spec(_image_attempt_id())
+    cmds = _run(_pm(), [  # _pm() scope 默认 "global"
+        _created(),
+        ProviderExecutionSpecRecordedEvt(attempt_id=spec.attempt_id, spec=spec),
+        _reserved(spec),
+        ReconciliationTickEvt(  # 外部 scope,即便早已超阈值也不评估
+            scope="other", as_of=_T0 + timedelta(hours=5), policy_version="1", sequence=1
+        ),
+    ])
+    assert not _of(cmds, InitiateProviderOpCmd)
+    assert not _of(cmds, AbortBeforeSubmissionCmd)
+
+
+def test_reconciler_no_release_for_unreserved_or_untracked_abort() -> None:
+    from studio.production.budget import ReleaseBudgetCmd
+
+    spec = _spec(_image_attempt_id())
+    op = spec.operation_id
+    # 已跟踪但未 reserved -> 外部墓碑不触发对不存在预留的 Release
+    unreserved = _run(_pm(), [
+        _created(),
+        ProviderExecutionSpecRecordedEvt(attempt_id=spec.attempt_id, spec=spec),
+        ProviderOperationAbortedEvt(operation_id=op, reason="external"),
+    ])
+    assert not _of(unreserved, ReleaseBudgetCmd)
+    # 完全未跟踪的 op 墓碑同样不释放
+    untracked = _run(_pm(), [ProviderOperationAbortedEvt(operation_id="ghost", reason="x")])
+    assert not _of(untracked, ReleaseBudgetCmd)
+
+
 def test_reconciler_ignores_released_and_wrong_policy() -> None:
     spec = _spec(_image_attempt_id())
     op = spec.operation_id
@@ -237,8 +270,8 @@ def test_reconciler_ignores_released_and_wrong_policy() -> None:
             currency="CNY", quote_digest=spec.quote_digest(),
         ),
         _tick(_T0 + timedelta(hours=2), 1),  # 已释放 -> 不再动作
-        ReconciliationTickEvt(
-            scope="g", as_of=_T0 + timedelta(hours=3), policy_version="9", sequence=2
+        ReconciliationTickEvt(  # 正确 scope、错误 policy_version -> 被忽略
+            scope="global", as_of=_T0 + timedelta(hours=3), policy_version="9", sequence=2
         ),
     ])
     from studio.production.budget import ReleaseBudgetCmd

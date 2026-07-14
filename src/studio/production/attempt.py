@@ -53,6 +53,7 @@ class AttemptState(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     status: TaskAttemptStatus | None = None
+    attempt_id: str | None = None
     stage_id: str | None = None
     project_id: str | None = None
     output_key: str | None = None
@@ -67,6 +68,13 @@ class TaskAttemptDecider:
     def __init__(
         self, spec: CompiledPipelineSpec, executors: dict[str, Executor]
     ) -> None:
+        # PROVIDER stage 必须无条件走异步路径;注册同步 executor 属配置错误,fail-fast。
+        for stage_id in executors:
+            st = spec.by_stage(stage_id)
+            if st is not None and st.executor_kind is ExecutorKind.PROVIDER:
+                raise ValueError(
+                    f"PROVIDER stage {stage_id} 不得注册同步 executor(必须走异步流水线)"
+                )
         self._spec = spec
         self._executors = executors
 
@@ -76,6 +84,9 @@ class TaskAttemptDecider:
     def decide(
         self, state: AttemptState, command: AttemptCommand
     ) -> Accepted[AttemptEvent] | Rejected:
+        # owner 封闭:一旦创建,后续命令的 attempt_id 必须一致。
+        if state.attempt_id is not None and command.attempt_id != state.attempt_id:
+            return Rejected("wrong_attempt", "attempt_id 与本流不一致")
         if isinstance(command, CreateTaskAttemptCmd):
             return self._create(state, command)
         if isinstance(command, RecordExecutionSpecCmd):
@@ -119,6 +130,8 @@ class TaskAttemptDecider:
         stage = self._spec.by_stage(cmd.stage_id)
         if stage is None:
             return Rejected("unknown_stage", f"未知 stage {cmd.stage_id}")
+        if cmd.output_key != stage.output_key:
+            return Rejected("output_key_mismatch", "output_key 与 stage 输出不一致")
         if cmd.series_id != domain_ids.series_id(
             cmd.project_id, cmd.output_key, cmd.partition_key
         ):
@@ -144,24 +157,25 @@ class TaskAttemptDecider:
             ),
         ]
 
+        if stage.executor_kind is ExecutorKind.PROVIDER:
+            # 无条件异步:PROVIDER 只产 Created+InputsBound,经 provider 流水线产候选。
+            return Accepted(tuple(base))
         executor = self._executors.get(cmd.stage_id)
-        if executor is not None:
-            payload = executor(cmd.stage_id, cmd.exact_refs, cmd.partition_key)
-            base.append(
-                ProposedEvent(
-                    "artifact-candidate-produced",
-                    ArtifactCandidateProducedEvt(
-                        candidate_id=identity.candidate_id(cmd.attempt_id, cmd.output_key),
-                        attempt_id=cmd.attempt_id, project_id=cmd.project_id,
-                        series_id=cmd.series_id, output_key=cmd.output_key,
-                        partition_key=cmd.partition_key, digest=digest(payload),
-                        payload=payload,
-                    ),
-                )
-            )
-        elif stage.executor_kind is not ExecutorKind.PROVIDER:
+        if executor is None:
             return Rejected("no_executor", f"stage {cmd.stage_id} 无 executor")
-        # PROVIDER 无 executor:只产 Created+InputsBound,等待异步流水线。
+        payload = executor(cmd.stage_id, cmd.exact_refs, cmd.partition_key)
+        base.append(
+            ProposedEvent(
+                "artifact-candidate-produced",
+                ArtifactCandidateProducedEvt(
+                    candidate_id=identity.candidate_id(cmd.attempt_id, cmd.output_key),
+                    attempt_id=cmd.attempt_id, project_id=cmd.project_id,
+                    series_id=cmd.series_id, output_key=cmd.output_key,
+                    partition_key=cmd.partition_key, digest=digest(payload),
+                    payload=payload,
+                ),
+            )
+        )
         return Accepted(tuple(base))
 
     # -- RecordExecutionSpec ----------------------------------------------- #
@@ -202,13 +216,12 @@ class TaskAttemptDecider:
     def _record_result(
         self, state: AttemptState, cmd: RecordProviderResultCmd
     ) -> Accepted[AttemptEvent] | Rejected:
-        fingerprint = digest(cmd.payload.model_dump(mode="json"))
-        if state.status is _S.SUCCEEDED:
-            if state.result_fingerprint == fingerprint:
-                return Accepted(())  # 幂等
-            raise IdempotencyConflict(cmd.attempt_id, "provider 结果不一致")
-        if state.status not in (_S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION):
+        if state.status not in (
+            _S.SUCCEEDED, _S.WAITING_PROVIDER, _S.WAITING_RECONCILIATION
+        ):
             return Rejected("bad_transition", f"record_result 不允许自 {state.status}")
+        # owner(attempt_id)已在 decide 顶层校验;此处先封 operation_id / 输出类型 / blob_ref,
+        # 再比对结果指纹,避免伪造 operation_id/blob_ref 借相同 payload 冒充幂等成功。
         if state.spec is None or cmd.operation_id != state.spec.operation_id:
             return Rejected("operation_mismatch", "operation_id 与 spec 不一致")
         stage = self._spec.by_stage(state.stage_id) if state.stage_id else None
@@ -218,6 +231,13 @@ class TaskAttemptDecider:
         payload_blob = getattr(cmd.payload, "blob_ref", None)
         if payload_blob is not None and payload_blob != cmd.blob_ref:
             return Rejected("blob_ref_mismatch", "payload.blob_ref 与结果不一致")
+        fingerprint = _result_fingerprint(
+            cmd.attempt_id, cmd.operation_id, cmd.blob_ref, cmd.payload
+        )
+        if state.status is _S.SUCCEEDED:
+            if state.result_fingerprint == fingerprint:
+                return Accepted(())  # 幂等(全字段一致)
+            raise IdempotencyConflict(cmd.attempt_id, "provider 结果不一致")
         assert state.output_key is not None
         return Accepted(
             (
@@ -257,6 +277,7 @@ class TaskAttemptDecider:
             return state.model_copy(
                 update={
                     "status": _S.INPUTS_BOUND,
+                    "attempt_id": event.attempt_id,
                     "stage_id": event.stage_id,
                     "project_id": event.project_id,
                     "output_key": event.output_key,
@@ -279,10 +300,31 @@ class TaskAttemptDecider:
         if isinstance(event, AttemptFailedEvt):
             return state.model_copy(update={"status": _S.FAILED})
         if isinstance(event, ArtifactCandidateProducedEvt):
+            op_id = state.spec.operation_id if state.spec else None
+            blob = getattr(event.payload, "blob_ref", None)
             return state.model_copy(
                 update={
                     "status": _S.SUCCEEDED,
-                    "result_fingerprint": digest(event.payload.model_dump(mode="json")),
+                    "result_fingerprint": _result_fingerprint(
+                        state.attempt_id, op_id, blob, event.payload
+                    ),
                 }
             )
         return state
+
+
+def _result_fingerprint(
+    attempt_id: str | None,
+    operation_id: str | None,
+    blob_ref: str | None,
+    payload: ArtifactPayload,
+) -> str:
+    """结果幂等指纹:含 owner + operation + blob_ref + payload,异结果必冲突。"""
+    return digest(
+        {
+            "attempt_id": attempt_id,
+            "operation_id": operation_id,
+            "blob_ref": blob_ref,
+            "payload_digest": digest(payload),
+        }
+    )

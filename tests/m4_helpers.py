@@ -28,6 +28,7 @@ from studio.production.attempt import TaskAttemptDecider
 from studio.production.budget import BudgetDecider, InitializeBudgetCmd
 from studio.production.dispatch import canonical_target
 from studio.production.execution_spec import ProviderExecutionSpec
+from studio.production.payloads import InitializePipelineCmd
 from studio.production.pipeline import golden_compiled, golden_selectors
 from studio.production.planning_pm import (
     ExecutionPlanningProcessManager,
@@ -45,6 +46,9 @@ from studio.production.provider_op import (
     ClaimSubmissionCmd,
     ProviderOperationDecider,
     ProviderResultRef,
+    ReconcileSubmittedCmd,
+    ReconcileSucceededCmd,
+    RecordSubmissionUnknownCmd,
     RecordSubmittedCmd,
     RecordSucceededCmd,
 )
@@ -149,6 +153,17 @@ def init_budget_command(
     )
 
 
+def init_pipeline_command(project_id: str) -> CommandEnvelope[object]:
+    """Golden(PROVIDER image)流水线初始化。"""
+    return _cmd(
+        identity.project_stream(project_id), "init",
+        InitializePipelineCmd(
+            project_id=project_id, pipeline_spec_id=golden_compiled().spec_id
+        ),
+        f"init-{project_id}",
+    )
+
+
 def initiated_ops(stack: M4Stack) -> list[tuple[str, ProviderExecutionSpec]]:
     from studio.production.provider_op import ProviderOperationInitiatedEvt
 
@@ -184,6 +199,39 @@ def succeed_command(op: str, spec: ProviderExecutionSpec) -> CommandEnvelope[obj
             provider_event_id=f"ok-{op}",
         ),
         f"succeed-{op}",
+    )
+
+
+def record_unknown_command(op: str) -> CommandEnvelope[object]:
+    return _cmd(
+        identity.provider_op_stream(op), f"unknown:{op}",
+        RecordSubmissionUnknownCmd(operation_id=op, reason="timeout"),
+        f"unknown-{op}",
+    )
+
+
+def reconcile_submitted_command(op: str) -> CommandEnvelope[object]:
+    return _cmd(
+        identity.provider_op_stream(op), f"rsub:{op}",
+        ReconcileSubmittedCmd(
+            operation_id=op, job_id=f"job-{op}", authority_ref=f"auth-sub-{op}"
+        ),
+        f"rsub-{op}",
+    )
+
+
+def reconcile_succeeded_command(
+    op: str, spec: ProviderExecutionSpec
+) -> CommandEnvelope[object]:
+    return _cmd(
+        identity.provider_op_stream(op), f"rok:{op}",
+        ReconcileSucceededCmd(
+            operation_id=op,
+            result_ref=ProviderResultRef(blob_ref=f"blob://{op}", digest="a" * 64),
+            cost_actual=spec.estimated_cost, cost_currency=spec.currency,
+            authority_ref=f"auth-ok-{op}",
+        ),
+        f"rok-{op}",
     )
 
 

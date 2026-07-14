@@ -13,13 +13,17 @@ from m4_helpers import (
     build_m4_stack,
     claim_command,
     init_budget_command,
+    init_pipeline_command,
     initiated_ops,
+    reconcile_submitted_command,
+    reconcile_succeeded_command,
+    record_unknown_command,
     submit_command,
     succeed_command,
     tick_command,
 )
-from production_helpers import init_command
 from studio.domain import ids as domain_ids
+from studio.production.attempt_payloads import AttemptWaitingReconciliationEvt
 from studio.production.budget import BudgetCapturedEvt, BudgetReleasedEvt
 from studio.production.projections import ArtifactLifecycleView
 from studio.production.provider_op import ProviderOperationAbortedEvt
@@ -42,7 +46,7 @@ def _image_current(stack: Any, shot: str) -> Any:
 def test_golden_provider_pipeline_end_to_end() -> None:
     stack = build_m4_stack()
     stack.bus.publish(init_budget_command("p"))
-    stack.bus.publish(init_command("p"))
+    stack.bus.publish(init_pipeline_command("p"))
     stack.driver.run_until_quiescent()
 
     ops = initiated_ops(stack)
@@ -66,7 +70,7 @@ def test_golden_provider_pipeline_end_to_end() -> None:
 def test_duplicate_activity_delivery_is_idempotent() -> None:
     stack = build_m4_stack()
     stack.bus.publish(init_budget_command("p"))
-    stack.bus.publish(init_command("p"))
+    stack.bus.publish(init_pipeline_command("p"))
     stack.driver.run_until_quiescent()
     ops = initiated_ops(stack)
 
@@ -85,10 +89,32 @@ def test_duplicate_activity_delivery_is_idempotent() -> None:
         assert _image_current(stack, shot) is not None
 
 
+def test_unknown_recovery_reaches_success() -> None:
+    stack = build_m4_stack()
+    stack.bus.publish(init_budget_command("p"))
+    stack.bus.publish(init_pipeline_command("p"))
+    stack.driver.run_until_quiescent()
+    ops = initiated_ops(stack)
+
+    # 提交结果未知 -> 对账确认已提交 -> 对账确认成功
+    for op, spec in ops:
+        stack.bus.publish(claim_command(op))
+        stack.bus.publish(record_unknown_command(op))
+        stack.bus.publish(reconcile_submitted_command(op))
+        stack.bus.publish(reconcile_succeeded_command(op, spec))
+    stack.driver.run_until_quiescent()
+
+    # UNKNOWN 已接入 PM:attempt 经过 WAITING_RECONCILIATION
+    assert len(_payloads(stack, AttemptWaitingReconciliationEvt)) == 2
+    for shot in ("shot_01", "shot_02"):
+        assert _image_current(stack, shot) is not None
+    assert len(_payloads(stack, BudgetCapturedEvt)) == 2
+
+
 def test_orphan_reconcile_recycles_and_releases() -> None:
     stack = build_m4_stack()
     stack.bus.publish(init_budget_command("p"))
-    stack.bus.publish(init_command("p"))
+    stack.bus.publish(init_pipeline_command("p"))
     stack.driver.run_until_quiescent()
     ops = initiated_ops(stack)
     assert len(ops) == 2  # 已预留 + 已 INITIATED,但没有 ActivityWorker 推进

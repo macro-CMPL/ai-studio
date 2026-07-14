@@ -97,6 +97,7 @@ class BudgetReservationDeclinedEvt(MessagePayload):
     amount: NonNegativeMoney
     available: Decimal
     currency: Currency
+    quote_digest: Sha256Hex
 
 
 class BudgetCapturedEvt(MessagePayload):
@@ -295,6 +296,7 @@ class BudgetDecider:
                             amount=cmd.amount,
                             available=state.available,
                             currency=cmd.currency,
+                            quote_digest=cmd.quote_digest,
                         ),
                     ),
                 )

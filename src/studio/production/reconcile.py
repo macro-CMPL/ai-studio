@@ -154,11 +154,22 @@ class ReconcilerState(BaseModel):
 ReconcileCommand = InitiateProviderOpCmd | AbortBeforeSubmissionCmd | ReleaseBudgetCmd
 
 
+def _reservation_matches(
+    spec: ProviderExecutionSpec, amount: object, currency: str, quote_digest: str
+) -> bool:
+    return (
+        amount == spec.estimated_cost
+        and currency == spec.currency
+        and quote_digest == spec.quote_digest()
+    )
+
+
 class OrphanReconciliationProcessManager:
     pm_id = "orphan-reconciler-pm"
 
-    def __init__(self, policy: ReconcilePolicy) -> None:
+    def __init__(self, policy: ReconcilePolicy, scope: str = "global") -> None:
         self._policy = policy
+        self._scope = scope
 
     def initial_state(self) -> ReconcilerState:
         return ReconcilerState()
@@ -182,9 +193,7 @@ class OrphanReconciliationProcessManager:
         if isinstance(payload, ProviderExecutionSpecRecordedEvt):
             return self._track(state, payload)
         if isinstance(payload, BudgetReservedEvt):
-            return Reaction(
-                state=self._patch(state, payload.operation_id, reserved=True), commands=()
-            )
+            return self._on_reserved(state, payload)
         if isinstance(payload, ProviderOperationInitiatedEvt):
             return Reaction(
                 state=self._patch(
@@ -240,6 +249,21 @@ class OrphanReconciliationProcessManager:
             return self._on_tick(state, payload)
         return Reaction(state=state, commands=())
 
+    def _on_reserved(
+        self, state: ReconcilerState, payload: BudgetReservedEvt
+    ) -> Reaction[ReconcilerState, ReconcileCommand]:
+        op = state.op_of(payload.operation_id)
+        if op is None:
+            return Reaction(state=state, commands=())
+        # 只有预留内容与 spec 一致才确认;否则不 reserved(_on_aborted 不会释放)。
+        if not _reservation_matches(
+            op.spec, payload.amount, payload.currency, payload.quote_digest
+        ):
+            return Reaction(state=state, commands=())
+        return Reaction(
+            state=state.with_op(op.model_copy(update={"reserved": True})), commands=()
+        )
+
     def _track(
         self, state: ReconcilerState, payload: ProviderExecutionSpecRecordedEvt
     ) -> Reaction[ReconcilerState, ReconcileCommand]:
@@ -258,7 +282,6 @@ class OrphanReconciliationProcessManager:
         operation_id: str,
         *,
         status: ProviderOpStatus | None = None,
-        reserved: bool | None = None,
         released: bool | None = None,
     ) -> ReconcilerState:
         op = state.op_of(operation_id)
@@ -267,8 +290,6 @@ class OrphanReconciliationProcessManager:
         updates: dict[str, object] = {}
         if status is not None:
             updates["op_status"] = status
-        if reserved is not None:
-            updates["reserved"] = reserved
         if released is not None:
             updates["released"] = released
         return state.with_op(op.model_copy(update=updates))
@@ -282,7 +303,8 @@ class OrphanReconciliationProcessManager:
         new_state = state.with_op(
             op.model_copy(update={"aborted": True, "op_status": ProviderOpStatus.ABORTED})
         )
-        if op.project_id is None:
+        # 仅在预留已确认、未释放、project 已知时释放:避免外部墓碑触发对不存在预留的释放。
+        if not op.reserved or op.released or op.project_id is None:
             return Reaction(state=new_state, commands=())
         # 第二轮:观察到取消墓碑后才释放预算。
         return Reaction(
@@ -303,7 +325,8 @@ class OrphanReconciliationProcessManager:
     def _on_tick(
         self, state: ReconcilerState, tick: ReconciliationTickEvt
     ) -> Reaction[ReconcilerState, ReconcileCommand]:
-        if tick.policy_version != self._policy.version:
+        # scope 隔离:只处理本 Reconciler 负责的 scope;policy_version 亦须匹配。
+        if tick.scope != self._scope or tick.policy_version != self._policy.version:
             return Reaction(state=state, commands=())
         new_ops: list[OpTracking] = []
         commands: list[ProposedCommand[ReconcileCommand]] = []

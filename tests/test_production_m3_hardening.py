@@ -171,12 +171,8 @@ def test_router_rejects_target_payload_mismatch() -> None:
 
 
 def test_attempt_decider_rejects_forged_identity() -> None:
-    decider = TaskAttemptDecider(
-        golden_compiled(),
-        {"image": lambda stage, refs, part: ImagePayload(
-            shot_id=part or "", prompt="p", blob_ref="b"
-        )},
-    )
+    # image 是 PROVIDER stage:无同步 executor(异步路径),有效创建仍 Accepted。
+    decider = TaskAttemptDecider(golden_compiled(), {})
     project, stage, partition = "p", "image", "shot_01"
     series = domain_ids.series_id(project, "image", partition)
     tk = identity.task_key(project, stage, partition)
