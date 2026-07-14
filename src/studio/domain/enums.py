@@ -81,13 +81,20 @@ class DependencyStatus(StrEnum):
 
 
 class ProviderOpStatus(StrEnum):
-    """外部 Provider 操作生命周期。SUBMISSION_UNKNOWN 需对账。"""
+    """外部 Provider 操作生命周期。
+
+    INITIATED(写前意图)→ CLAIMED(activity 认领,提交前墓碑)→ SUBMITTED → 终态。
+    SUBMISSION_UNKNOWN 是 parked 状态(非终态),可经对账恢复。
+    ABORTED 是提交前取消墓碑,使迟到的 Claim/Submit 被拒。
+    """
 
     INITIATED = "initiated"
+    CLAIMED = "claimed"
     SUBMITTED = "submitted"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SUBMISSION_UNKNOWN = "submission_unknown"
+    ABORTED = "aborted"
 
 
 class TaskAttemptStatus(StrEnum):
@@ -96,8 +103,19 @@ class TaskAttemptStatus(StrEnum):
     CREATED = "created"
     INPUTS_BOUND = "inputs_bound"
     RUNNING = "running"
+    WAITING_BUDGET = "waiting_budget"
+    WAITING_PROVIDER = "waiting_provider"
+    WAITING_RECONCILIATION = "waiting_reconciliation"
+    BLOCKED = "blocked"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class LedgerDirection(StrEnum):
+    """ADJUSTMENT 的方向(非负金额需显式方向)。"""
+
+    CREDIT = "credit"
+    DEBIT = "debit"
 
 
 class LedgerEntryType(StrEnum):

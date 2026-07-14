@@ -6,9 +6,15 @@ import json
 import uuid
 from collections.abc import Iterable
 
+from studio.domain import ids as _domain_ids
 from studio.serialization import digest
 
 from .values import BindingItem
+
+
+def operation_id(attempt_id_value: str, logical_operation_key: str) -> str:
+    """Provider 操作幂等键(复用 M1 domain.ids,attempt + 逻辑键派生)。"""
+    return _domain_ids.operation_id(attempt_id_value, logical_operation_key)
 
 NAMESPACE = uuid.UUID("c3a1e2d4-5b6f-5c7a-8d9e-0f1a2b3c4d5e")
 
