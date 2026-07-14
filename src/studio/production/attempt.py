@@ -62,6 +62,7 @@ class AttemptState(BaseModel):
     exact_refs: tuple[BindingItem, ...] = ()
     spec: ProviderExecutionSpec | None = None
     result_fingerprint: str | None = None
+    provider_phase: int = 0  # 单调递增;乱序命令低于本值被幂等忽略
 
 
 class TaskAttemptDecider:
@@ -95,18 +96,21 @@ class TaskAttemptDecider:
             return self._transition(
                 state, {_S.WAITING_BUDGET, _S.WAITING_RECONCILIATION}, _S.WAITING_PROVIDER,
                 AttemptWaitingProviderEvt(attempt_id=command.attempt_id), "waiting-provider",
+                min_phase=command.min_provider_phase,
             )
         if isinstance(command, MarkWaitingReconciliationCmd):
             return self._transition(
                 state, {_S.WAITING_PROVIDER}, _S.WAITING_RECONCILIATION,
                 AttemptWaitingReconciliationEvt(attempt_id=command.attempt_id),
                 "waiting-reconciliation",
+                min_phase=command.min_provider_phase,
             )
         if isinstance(command, MarkBlockedCmd):
             return self._transition(
                 state, {_S.WAITING_BUDGET}, _S.BLOCKED,
                 AttemptBlockedEvt(attempt_id=command.attempt_id, reason=command.reason),
                 "blocked",
+                min_phase=command.min_provider_phase,
             )
         if isinstance(command, MarkFailedCmd):
             return self._transition(
@@ -115,6 +119,7 @@ class TaskAttemptDecider:
                 _S.FAILED,
                 AttemptFailedEvt(attempt_id=command.attempt_id, reason=command.reason),
                 "failed",
+                min_phase=command.min_provider_phase,
             )
         if isinstance(command, RecordProviderResultCmd):
             return self._record_result(state, command)
@@ -265,7 +270,12 @@ class TaskAttemptDecider:
         target: TaskAttemptStatus,
         event: AttemptEvent,
         key: str,
+        *,
+        min_phase: int | None = None,
     ) -> Accepted[AttemptEvent] | Rejected:
+        # 乱序保护:命令携带 min_provider_phase,若低于当前 phase 则幂等忽略(过时命令)。
+        if min_phase is not None and min_phase < state.provider_phase:
+            return Accepted(())
         if state.status is target:
             return Accepted(())  # 幂等
         if state.status not in allowed:
@@ -289,16 +299,40 @@ class TaskAttemptDecider:
             return state.model_copy(update={"exact_refs": event.exact_refs})
         if isinstance(event, ProviderExecutionSpecRecordedEvt):
             return state.model_copy(
-                update={"status": _S.WAITING_BUDGET, "spec": event.spec}
+                update={
+                    "status": _S.WAITING_BUDGET,
+                    "spec": event.spec,
+                    "provider_phase": state.provider_phase + 1,
+                }
             )
         if isinstance(event, AttemptWaitingProviderEvt):
-            return state.model_copy(update={"status": _S.WAITING_PROVIDER})
+            return state.model_copy(
+                update={
+                    "status": _S.WAITING_PROVIDER,
+                    "provider_phase": state.provider_phase + 1,
+                }
+            )
         if isinstance(event, AttemptWaitingReconciliationEvt):
-            return state.model_copy(update={"status": _S.WAITING_RECONCILIATION})
+            return state.model_copy(
+                update={
+                    "status": _S.WAITING_RECONCILIATION,
+                    "provider_phase": state.provider_phase + 1,
+                }
+            )
         if isinstance(event, AttemptBlockedEvt):
-            return state.model_copy(update={"status": _S.BLOCKED})
+            return state.model_copy(
+                update={
+                    "status": _S.BLOCKED,
+                    "provider_phase": state.provider_phase + 1,
+                }
+            )
         if isinstance(event, AttemptFailedEvt):
-            return state.model_copy(update={"status": _S.FAILED})
+            return state.model_copy(
+                update={
+                    "status": _S.FAILED,
+                    "provider_phase": state.provider_phase + 1,
+                }
+            )
         if isinstance(event, ArtifactCandidateProducedEvt):
             op_id = state.spec.operation_id if state.spec else None
             blob = getattr(event.payload, "blob_ref", None)

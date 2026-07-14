@@ -29,23 +29,27 @@ class RecordExecutionSpecCmd(MessagePayload):
 class MarkWaitingProviderCmd(MessagePayload):
     type: Literal["mark_waiting_provider"] = "mark_waiting_provider"
     attempt_id: str
+    min_provider_phase: int | None = None
 
 
 class MarkWaitingReconciliationCmd(MessagePayload):
     type: Literal["mark_waiting_reconciliation"] = "mark_waiting_reconciliation"
     attempt_id: str
+    min_provider_phase: int | None = None
 
 
 class MarkBlockedCmd(MessagePayload):
     type: Literal["mark_blocked"] = "mark_blocked"
     attempt_id: str
     reason: str
+    min_provider_phase: int | None = None
 
 
 class MarkFailedCmd(MessagePayload):
     type: Literal["mark_failed"] = "mark_failed"
     attempt_id: str
     reason: str
+    min_provider_phase: int | None = None
 
 
 class RecordProviderResultCmd(MessagePayload):

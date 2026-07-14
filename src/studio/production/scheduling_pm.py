@@ -58,6 +58,8 @@ class SchedulingState(BaseModel):
     project_by_attempt: tuple[tuple[str, str], ...] = ()
     specs: tuple[ProviderExecutionSpec, ...] = ()
     confirmed: tuple[str, ...] = ()  # 预留内容与 spec 一致的 operation_id
+    # 跟踪每个 op 的 provider_phase 进展(用于乱序保护)
+    phase_by_op: tuple[tuple[str, int], ...] = ()
 
     def project_of(self, attempt_id: str) -> str | None:
         return next((p for (a, p) in self.project_by_attempt if a == attempt_id), None)
@@ -67,6 +69,16 @@ class SchedulingState(BaseModel):
 
     def is_confirmed(self, operation_id: str) -> bool:
         return operation_id in self.confirmed
+
+    def phase_of(self, operation_id: str) -> int:
+        return next((p for (o, p) in self.phase_by_op if o == operation_id), 1)
+
+    def advance_phase(self, operation_id: str) -> SchedulingState:
+        current = self.phase_of(operation_id)
+        others = tuple((o, p) for (o, p) in self.phase_by_op if o != operation_id)
+        return self.model_copy(
+            update={"phase_by_op": (*others, (operation_id, current + 1))}
+        )
 
 
 class ProviderSchedulingProcessManager:
@@ -175,14 +187,18 @@ class ProviderSchedulingProcessManager:
             or not state.is_confirmed(payload.operation_id)
         ):
             return Reaction(state=state, commands=())
+        phase = state.phase_of(payload.operation_id)
+        new_state = state.advance_phase(payload.operation_id)
         return Reaction(
-            state=state,
+            state=new_state,
             commands=(
                 ProposedCommand(
                     reaction_name="waiting-provider",
                     command_key=f"waiting:{payload.operation_id}",
                     target=identity.attempt_stream(spec.attempt_id),
-                    payload=MarkWaitingProviderCmd(attempt_id=spec.attempt_id),
+                    payload=MarkWaitingProviderCmd(
+                        attempt_id=spec.attempt_id, min_provider_phase=phase
+                    ),
                 ),
             ),
         )
@@ -194,14 +210,20 @@ class ProviderSchedulingProcessManager:
         spec = state.spec_of(operation_id)
         if spec is None or not state.is_confirmed(operation_id):
             return Reaction(state=state, commands=())
+        phase = state.phase_of(operation_id)
+        new_state = state.advance_phase(operation_id)
         if provider:
-            cmd: SchedulingCommand = MarkWaitingProviderCmd(attempt_id=spec.attempt_id)
+            cmd: SchedulingCommand = MarkWaitingProviderCmd(
+                attempt_id=spec.attempt_id, min_provider_phase=phase
+            )
             name, key = "resubmitted", f"resubmitted:{operation_id}"
         else:
-            cmd = MarkWaitingReconciliationCmd(attempt_id=spec.attempt_id)
+            cmd = MarkWaitingReconciliationCmd(
+                attempt_id=spec.attempt_id, min_provider_phase=phase
+            )
             name, key = "waiting-reconciliation", f"reconcile:{operation_id}"
         return Reaction(
-            state=state,
+            state=new_state,
             commands=(
                 ProposedCommand(
                     reaction_name=name, command_key=key,
@@ -228,14 +250,17 @@ class ProviderSchedulingProcessManager:
             spec, payload.amount, payload.currency, payload.quote_digest
         ):
             return Reaction(state=state, commands=())
+        phase = state.phase_of(payload.operation_id)
+        new_state = state.advance_phase(payload.operation_id)
         return Reaction(
-            state=state,
+            state=new_state,
             commands=(
                 ProposedCommand(
                     reaction_name="blocked", command_key=f"blocked:{payload.operation_id}",
                     target=identity.attempt_stream(spec.attempt_id),
                     payload=MarkBlockedCmd(
-                        attempt_id=spec.attempt_id, reason="budget_declined"
+                        attempt_id=spec.attempt_id, reason="budget_declined",
+                        min_provider_phase=phase,
                     ),
                 ),
             ),
