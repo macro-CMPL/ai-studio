@@ -119,7 +119,7 @@ class ProviderResultProcessManager:
         if isinstance(payload, ProviderOperationAbortedEvt):
             return self._on_aborted(state, payload)
         if isinstance(payload, BudgetSettlementCompletedEvt):
-            return self._on_settled(state, payload, event.stream_id)
+            return self._on_settled(state, payload, event.stream_id, event.global_position)
         return Reaction(state=state, commands=())
 
     def _guarded(self, state: ResultPMState, operation_id: str) -> bool:
@@ -226,7 +226,8 @@ class ProviderResultProcessManager:
         )
 
     def _on_settled(
-        self, state: ResultPMState, evt: BudgetSettlementCompletedEvt, stream_id: str
+        self, state: ResultPMState, evt: BudgetSettlementCompletedEvt,
+        stream_id: str, gp: int,
     ) -> Reaction[ResultPMState, ResultCommand]:
         pending = state.pending_of(evt.operation_id)
         if pending is None or evt.operation_id in state.completed:
@@ -259,6 +260,7 @@ class ProviderResultProcessManager:
             record = RecordProviderResultCmd(
                 attempt_id=pending.attempt_id, operation_id=evt.operation_id,
                 blob_ref=pending.result_ref.blob_ref, payload=result_payload,
+                status_revision=gp,
             )
             return Reaction(
                 state=completed,
@@ -279,7 +281,8 @@ class ProviderResultProcessManager:
                     command_key=f"failed:{evt.operation_id}",
                     target=identity.attempt_stream(pending.attempt_id),
                     payload=MarkFailedCmd(
-                        attempt_id=pending.attempt_id, reason=pending.reason
+                        attempt_id=pending.attempt_id, reason=pending.reason,
+                        status_revision=gp,
                     ),
                 ),
             ),

@@ -63,6 +63,7 @@ class AttemptState(BaseModel):
     spec: ProviderExecutionSpec | None = None
     result_fingerprint: str | None = None
     last_status_revision: int = 0  # 最后处理的 status_revision(causal event global_position)
+    last_status_fingerprint: str | None = None  # 同 revision 冲突检测
 
 
 class TaskAttemptDecider:
@@ -283,27 +284,38 @@ class TaskAttemptDecider:
         """乱序安全的状态迁移。
 
         revision < last_status_revision → 幂等忽略(过时命令)。
+        revision == last_status_revision → 同 fingerprint 幂等,异 fingerprint 冲突。
         revision > last_status_revision → 允许跳过中间观察状态(新命令先到)。
-        revision == last_status_revision + target 相同 → 幂等。
-        None → 向后兼容(不做乱序校验,按 allowed 判定;仅限 WAITING_BUDGET 之后的状态)。
+        None → 向后兼容(不做乱序校验)。
         """
-        # 乱序保护(最高优先级):过时命令幂等忽略
-        if status_revision is not None and status_revision < state.last_status_revision:
-            return Accepted(())
+        fp = _status_fingerprint(target, event)
+        if status_revision is not None:
+            # 乱序保护
+            if status_revision < state.last_status_revision:
+                return Accepted(())  # 过时
+            if status_revision == state.last_status_revision:
+                # 同 revision:同 fingerprint 幂等,异 fingerprint 冲突
+                if state.last_status_fingerprint == fp:
+                    return Accepted(())
+                if state.last_status_fingerprint is not None:
+                    raise IdempotencyConflict(
+                        f"status_revision={status_revision}",
+                        "同 revision 不同目标/内容",
+                    )
         # 幂等:已是目标状态
         if state.status is target:
             return Accepted(())
-        # 终态保护:SUCCEEDED/FAILED/BLOCKED 不接受非幂等迁移
+        # 终态保护
         if state.status in (_S.SUCCEEDED, _S.FAILED, _S.BLOCKED):
             if status_revision is not None:
-                return Accepted(())  # 终态后任何 revision 都幂等忽略
+                return Accepted(())
             return Rejected("bad_transition", f"{target} 不允许自 {state.status}")
-        # 必须已经过了 INPUTS_BOUND(spec 已记录)
+        # 未就绪
         if state.status is None or state.status is _S.INPUTS_BOUND:
             if status_revision is not None:
-                return Accepted(())  # 尚未就绪,幂等忽略(PM 会重试)
+                return Accepted(())
             return Rejected("bad_transition", f"{target} 不允许自 {state.status}")
-        # 在事件中记录 status_revision,以便 evolve 设置 last_status_revision
+        # 在事件中记录 status_revision + fingerprint
         if status_revision is not None and hasattr(event, "model_copy"):
             event = event.model_copy(update={"status_revision": status_revision})
         return Accepted((ProposedEvent(key, event),))
@@ -324,49 +336,57 @@ class TaskAttemptDecider:
         if isinstance(event, TaskInputsBoundEvt):
             return state.model_copy(update={"exact_refs": event.exact_refs})
         if isinstance(event, ProviderExecutionSpecRecordedEvt):
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.WAITING_BUDGET,
                     "spec": event.spec,
-                    "last_status_revision": event.status_revision
-                    if event.status_revision is not None
-                    else state.last_status_revision + 1,
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _status_fingerprint(
+                        _S.WAITING_BUDGET, event
+                    ),
                 }
             )
         if isinstance(event, AttemptWaitingProviderEvt):
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.WAITING_PROVIDER,
-                    "last_status_revision": event.status_revision
-                    if event.status_revision is not None
-                    else state.last_status_revision + 1,
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _status_fingerprint(
+                        _S.WAITING_PROVIDER, event
+                    ),
                 }
             )
         if isinstance(event, AttemptWaitingReconciliationEvt):
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.WAITING_RECONCILIATION,
-                    "last_status_revision": event.status_revision
-                    if event.status_revision is not None
-                    else state.last_status_revision + 1,
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _status_fingerprint(
+                        _S.WAITING_RECONCILIATION, event
+                    ),
                 }
             )
         if isinstance(event, AttemptBlockedEvt):
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.BLOCKED,
-                    "last_status_revision": event.status_revision
-                    if event.status_revision is not None
-                    else state.last_status_revision + 1,
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _status_fingerprint(
+                        _S.BLOCKED, event
+                    ),
                 }
             )
         if isinstance(event, AttemptFailedEvt):
+            rev = _resolve_rev(event.status_revision, state.last_status_revision)
             return state.model_copy(
                 update={
                     "status": _S.FAILED,
-                    "last_status_revision": event.status_revision
-                    if event.status_revision is not None
-                    else state.last_status_revision + 1,
+                    "last_status_revision": rev,
+                    "last_status_fingerprint": _status_fingerprint(_S.FAILED, event),
                 }
             )
         if isinstance(event, ArtifactCandidateProducedEvt):
@@ -398,3 +418,14 @@ def _result_fingerprint(
             "payload_digest": digest(payload),
         }
     )
+
+
+def _status_fingerprint(target: TaskAttemptStatus, event: AttemptEvent) -> str:
+    """状态迁移指纹:同 revision 时用于冲突检测。覆盖目标状态 + reason。"""
+    reason = getattr(event, "reason", None)
+    return digest({"target": target.value, "reason": reason})
+
+
+def _resolve_rev(event_rev: int | None, current: int) -> int:
+    """事件 revision:有则用事件值,无则递增(向后兼容)。"""
+    return event_rev if event_rev is not None else current + 1

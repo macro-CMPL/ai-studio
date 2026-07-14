@@ -204,3 +204,82 @@ def test_result_without_revision_from_waiting_budget_accepted() -> None:
     ))
     assert isinstance(dec, Accepted) and len(dec.events) == 1
     assert s.status is _S.SUCCEEDED
+
+
+def test_same_revision_same_target_idempotent() -> None:
+    """同 revision + 同 fingerprint → 幂等。"""
+    d, s, aid = _at_waiting_budget()
+    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert s.last_status_revision == 10
+    # 同 revision + 同 target -> 幂等
+    s2, dec = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert isinstance(dec, Accepted) and dec.events == ()
+    assert s2.status is _S.WAITING_PROVIDER
+
+
+def test_same_revision_different_target_conflicts() -> None:
+    """同 revision + 不同 target → IdempotencyConflict。"""
+    from studio.kernel.errors import IdempotencyConflict as IC
+
+    d, s, aid = _at_waiting_budget()
+    s, _ = _apply(d, s, MarkWaitingProviderCmd(attempt_id=aid, status_revision=10))
+    assert s.last_status_revision == 10
+    # 同 revision=10 + 不同 target(RECONCILIATION) -> 冲突
+    import pytest
+
+    with pytest.raises(IC):
+        d.decide(s, MarkWaitingReconciliationCmd(attempt_id=aid, status_revision=10))
+
+
+def test_result_pm_emits_status_revision() -> None:
+    """真实 ResultPM 发出 RecordProviderResultCmd 和 MarkFailedCmd 携带 status_revision。"""
+    from datetime import UTC, datetime
+
+    from studio.kernel.envelopes import EventEnvelope, MessagePayload
+    from studio.production.attempt_payloads import ProviderExecutionSpecRecordedEvt
+    from studio.production.budget import BudgetSettlementCompletedEvt
+    from studio.production.payloads import TaskAttemptCreatedEvt
+    from studio.production.pipeline import golden_compiled
+    from studio.production.provider_op import ProviderOperationSucceededEvt, ProviderResultRef
+    from studio.production.result_mapper import default_result_mappers
+    from studio.production.result_pm import ProviderResultProcessManager
+
+    _TS = datetime(2026, 1, 1, tzinfo=UTC)
+    pm = ProviderResultProcessManager(golden_compiled(), default_result_mappers())
+    spec = _spec(_image_attempt_id(_plan_binding()))
+    op = spec.operation_id
+
+    events: list[MessagePayload] = [
+        TaskAttemptCreatedEvt(
+            attempt_id=spec.attempt_id, project_id=_P, stage_id="image",
+            partition_key=_PART, output_key="image",
+            series_id=domain_ids.series_id(_P, "image", _PART),
+        ),
+        ProviderExecutionSpecRecordedEvt(attempt_id=spec.attempt_id, spec=spec),
+        ProviderOperationSucceededEvt(
+            operation_id=op,
+            result_ref=ProviderResultRef(blob_ref="blob://x", digest="a" * 64),
+            cost_actual=Decimal(10), cost_currency="CNY", provider_event_id="pe",
+        ),
+        BudgetSettlementCompletedEvt(
+            operation_id=op, outcome="captured", captured_amount=Decimal(10),
+            currency="CNY", quote_digest=spec.quote_digest(),
+        ),
+    ]
+    state = pm.initial_state()
+    result_cmds = []
+    for pos, payload in enumerate(events):
+        env: EventEnvelope[MessagePayload] = EventEnvelope(
+            event_id=f"evt-{pos}", schema_version=1,
+            stream_id=f"budget:{_P}" if pos == 3 else "s",
+            sequence=pos, global_position=pos * 10,
+            correlation_id="c", causation_id="x", recorded_at=_TS, payload=payload,
+        )
+        reaction = pm.react(state, env)
+        state = reaction.state
+        result_cmds.extend(reaction.commands)
+
+    record = [c for c in result_cmds if isinstance(c.payload, RecordProviderResultCmd)]
+    assert len(record) == 1
+    # global_position of settlement event = 30
+    assert record[0].payload.status_revision == 30
