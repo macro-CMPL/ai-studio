@@ -172,9 +172,10 @@ def test_router_rejects_target_payload_mismatch() -> None:
 
 def test_attempt_decider_rejects_forged_identity() -> None:
     decider = TaskAttemptDecider(
+        golden_compiled(),
         {"image": lambda stage, refs, part: ImagePayload(
             shot_id=part or "", prompt="p", blob_ref="b"
-        )}
+        )},
     )
     project, stage, partition = "p", "image", "shot_01"
     series = domain_ids.series_id(project, "image", partition)

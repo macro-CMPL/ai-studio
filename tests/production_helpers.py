@@ -102,11 +102,12 @@ def build_production_stack() -> ProductionStack:
     deciders = {
         "project": ProjectDecider(),
         "attempt": TaskAttemptDecider(
+            golden_compiled(),
             {
                 "storyboard": _storyboard_exec,
                 "plan": _plan_exec,
                 "image": _image_exec,
-            }
+            },
         ),
         "artifact-series": ArtifactSeriesDecider(),
     }

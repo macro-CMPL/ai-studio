@@ -73,5 +73,17 @@ def series_stream(series_id: str) -> str:
     return f"artifact-series:{series_id}"
 
 
+def budget_stream(project_id: str) -> str:
+    return f"budget:{project_id}"
+
+
+def provider_op_stream(operation_id_value: str) -> str:
+    return f"provider-op:{operation_id_value}"
+
+
+def reconciliation_stream(scope: str) -> str:
+    return f"reconciliation:{scope}"
+
+
 def stream_kind(target: str) -> str:
     return target.split(":", 1)[0]
