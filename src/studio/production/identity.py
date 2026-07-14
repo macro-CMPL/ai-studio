@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Iterable
 
 from studio.domain import ids as _domain_ids
+from studio.kernel.errors import ContractViolation
 from studio.serialization import digest
 
 from .values import BindingItem
@@ -87,3 +88,22 @@ def reconciliation_stream(scope: str) -> str:
 
 def stream_kind(target: str) -> str:
     return target.split(":", 1)[0]
+
+
+def require_budget_owner(
+    *, stream_id: str, project_id: str, operation_id: str
+) -> None:
+    """预算事件必须来自本项目的 ``budget:{project}`` 流,否则跨项目串账。
+
+    scheduling / result / reconcile 三个 provider PM 仅按 operation_id + 内容指纹
+    (amount/currency/quote_digest)核对预算事件是不够的:内容完全一致但来自
+    ``budget:{other}`` 的伪造/误路由事件会导致跨项目串账 —— 在正确项目未预留时
+    发起付费操作、跨项目结算、或抑制正确项目的释放。owner(来源流)不一致时抛
+    ContractViolation,绝不静默接受。
+    """
+    expected = budget_stream(project_id)
+    if stream_id != expected:
+        raise ContractViolation(
+            f"预算事件来自非本项目流:operation={operation_id} "
+            f"expected={expected} got={stream_id}"
+        )

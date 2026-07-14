@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+
+import pytest
 
 from studio.domain import ids as domain_ids
 from studio.domain.artifacts import (
@@ -16,6 +19,7 @@ from studio.domain.artifacts import (
 from studio.domain.enums import PropagationMode
 from studio.kernel.decisions import Accepted, Rejected
 from studio.kernel.envelopes import EventEnvelope, MessagePayload
+from studio.kernel.errors import ContractViolation
 from studio.production import identity
 from studio.production.attempt_payloads import ProviderExecutionSpecRecordedEvt
 from studio.production.budget import BudgetReservedEvt, BudgetSettlementCompletedEvt
@@ -104,12 +108,29 @@ def _tick(as_of: datetime, seq: int) -> ReconciliationTickEvt:
     )
 
 
-def _run(pm: Any, payloads: list[MessagePayload]) -> list[Any]:
+_BUDGET_EVENTS = (BudgetReservedEvt, BudgetSettlementCompletedEvt)
+
+
+def _origin_stream(payload: MessagePayload) -> str:
+    """预算事件默认来自本项目 budget 流;其余事件流 ID 与 owner 校验无关。"""
+    if isinstance(payload, _BUDGET_EVENTS):
+        return identity.budget_stream(_P)
+    return "s"
+
+
+def _run(
+    pm: Any, payloads: Sequence[MessagePayload | tuple[MessagePayload, str]]
+) -> list[Any]:
+    """喂事件流。元素可为 payload(自动推导来源流)或 (payload, stream_id) 元组。"""
     state = pm.initial_state()
     commands: list[Any] = []
-    for pos, payload in enumerate(payloads):
+    for pos, item in enumerate(payloads):
+        if isinstance(item, tuple):
+            payload, stream_id = item
+        else:
+            payload, stream_id = item, _origin_stream(item)
         env: EventEnvelope[MessagePayload] = EventEnvelope(
-            event_id=f"evt-{pos}", schema_version=1, stream_id="s", sequence=pos,
+            event_id=f"evt-{pos}", schema_version=1, stream_id=stream_id, sequence=pos,
             global_position=pos, correlation_id="c", causation_id="x",
             recorded_at=_TS, payload=payload,
         )
@@ -278,3 +299,35 @@ def test_reconciler_ignores_released_and_wrong_policy() -> None:
 
     assert len(_of(cmds, ReleaseBudgetCmd)) == 1  # 仅 Aborted 触发的一次
     assert not _of(cmds, AbortBeforeSubmissionCmd)
+
+
+# --- 对抗:跨项目预算 owner --- #
+
+
+def test_reconciler_foreign_reserve_rejected() -> None:
+    """内容一致但来自 budget:{other} 的预留 -> ContractViolation,绝不确认(不释放)。"""
+    spec = _spec(_image_attempt_id())
+    with pytest.raises(ContractViolation):
+        _run(_pm(), [
+            _created(),
+            ProviderExecutionSpecRecordedEvt(attempt_id=spec.attempt_id, spec=spec),
+            (_reserved(spec), identity.budget_stream("other")),  # 跨项目 budget 流
+        ])
+
+
+def test_reconciler_foreign_release_rejected() -> None:
+    """释放墓碑来自 budget:{other} -> ContractViolation,绝不据此抑制正确释放。"""
+    spec = _spec(_image_attempt_id())
+    op = spec.operation_id
+    with pytest.raises(ContractViolation):
+        _run(_pm(), [
+            _created(),
+            ProviderExecutionSpecRecordedEvt(attempt_id=spec.attempt_id, spec=spec),
+            (
+                BudgetSettlementCompletedEvt(
+                    operation_id=op, outcome="released", captured_amount=Decimal(0),
+                    currency="CNY", quote_digest=spec.quote_digest(),
+                ),
+                identity.budget_stream("other"),
+            ),
+        ])

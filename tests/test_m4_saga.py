@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -18,6 +19,7 @@ from studio.domain.artifacts import (
 from studio.domain.enums import ArtifactType, PropagationMode
 from studio.kernel.envelopes import EventEnvelope, MessagePayload
 from studio.kernel.errors import ContractViolation
+from studio.production import identity
 from studio.production.attempt_payloads import (
     MarkBlockedCmd,
     MarkFailedCmd,
@@ -85,8 +87,6 @@ def _plan_binding() -> BindingItem:
 
 
 def _image_attempt_id() -> str:
-    from studio.production import identity
-
     tk = identity.task_key(_P, "image", _PART)
     return identity.attempt_id(tk, identity.input_binding_digest((_plan_binding(),)), 0)
 
@@ -107,12 +107,33 @@ def _created() -> TaskAttemptCreatedEvt:
     )
 
 
-def _run(pm: Any, payloads: list[MessagePayload]) -> list[Any]:
+_BUDGET_EVENTS = (
+    BudgetReservedEvt,
+    BudgetReservationDeclinedEvt,
+    BudgetSettlementCompletedEvt,
+)
+
+
+def _origin_stream(payload: MessagePayload) -> str:
+    """预算事件默认来自本项目 budget 流;其余事件流 ID 与 owner 校验无关。"""
+    if isinstance(payload, _BUDGET_EVENTS):
+        return identity.budget_stream(_P)
+    return "s"
+
+
+def _run(
+    pm: Any, payloads: Sequence[MessagePayload | tuple[MessagePayload, str]]
+) -> list[Any]:
+    """喂事件流。元素可为 payload(自动推导来源流)或 (payload, stream_id) 元组。"""
     state = pm.initial_state()
     commands: list[Any] = []
-    for pos, payload in enumerate(payloads):
+    for pos, item in enumerate(payloads):
+        if isinstance(item, tuple):
+            payload, stream_id = item
+        else:
+            payload, stream_id = item, _origin_stream(item)
         env: EventEnvelope[MessagePayload] = EventEnvelope(
-            event_id=f"evt-{pos}", schema_version=1, stream_id="s", sequence=pos,
+            event_id=f"evt-{pos}", schema_version=1, stream_id=stream_id, sequence=pos,
             global_position=pos, correlation_id="c", causation_id="x",
             recorded_at=_TS, payload=payload,
         )
@@ -413,3 +434,75 @@ def test_result_completed_guard_no_republish() -> None:
     ]
     cmds = _run(_result_pm(), events)
     assert len(_of(cmds, RecordProviderResultCmd)) == 1  # 不重复发布
+
+
+# --------------------------------------------------------------------------- #
+# 对抗:跨项目预算 owner(内容一致但来自 budget:{other} 流)
+# --------------------------------------------------------------------------- #
+
+
+def test_scheduling_foreign_budget_reserve_rejected() -> None:
+    """内容完全匹配但来自 budget:{other} 的预留 -> ContractViolation,绝不 Initiate。"""
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    with pytest.raises(ContractViolation):
+        _run(
+            ProviderSchedulingProcessManager(),
+            [
+                _created(),
+                ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+                (
+                    BudgetReservedEvt(
+                        operation_id=op, amount=spec.estimated_cost, currency="CNY",
+                        quote_digest=spec.quote_digest(),
+                    ),
+                    identity.budget_stream("other"),  # 跨项目 budget 流
+                ),
+            ],
+        )
+
+
+def test_scheduling_foreign_budget_decline_rejected() -> None:
+    """来自 budget:{other} 的 decline 也不能误阻塞本项目 attempt。"""
+    aid = _image_attempt_id()
+    spec = _spec(aid)
+    op = spec.operation_id
+    with pytest.raises(ContractViolation):
+        _run(
+            ProviderSchedulingProcessManager(),
+            [
+                _created(),
+                ProviderExecutionSpecRecordedEvt(attempt_id=aid, spec=spec),
+                (
+                    BudgetReservationDeclinedEvt(
+                        operation_id=op, amount=spec.estimated_cost, available=Decimal(0),
+                        currency="CNY", quote_digest=spec.quote_digest(),
+                    ),
+                    identity.budget_stream("other"),
+                ),
+            ],
+        )
+
+
+def test_result_foreign_settlement_rejected() -> None:
+    """结算来自 budget:{other} -> ContractViolation,绝不跨项目发布结果。"""
+    spec = _spec(_image_attempt_id())
+    op = spec.operation_id
+    events: list[MessagePayload | tuple[MessagePayload, str]] = [
+        *_prelude(spec),
+        ProviderOperationSucceededEvt(
+            operation_id=op,
+            result_ref=ProviderResultRef(blob_ref="blob://final", digest="a" * 64),
+            cost_actual=Decimal("12.5"), cost_currency="CNY", provider_event_id="pe-1",
+        ),
+        (
+            BudgetSettlementCompletedEvt(
+                operation_id=op, outcome="captured", captured_amount=Decimal("12.5"),
+                currency="CNY", quote_digest=spec.quote_digest(),
+            ),
+            identity.budget_stream("other"),
+        ),
+    ]
+    with pytest.raises(ContractViolation):
+        _run(_result_pm(), events)

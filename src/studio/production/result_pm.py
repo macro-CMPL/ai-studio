@@ -119,7 +119,7 @@ class ProviderResultProcessManager:
         if isinstance(payload, ProviderOperationAbortedEvt):
             return self._on_aborted(state, payload)
         if isinstance(payload, BudgetSettlementCompletedEvt):
-            return self._on_settled(state, payload)
+            return self._on_settled(state, payload, event.stream_id)
         return Reaction(state=state, commands=())
 
     def _guarded(self, state: ResultPMState, operation_id: str) -> bool:
@@ -226,11 +226,17 @@ class ProviderResultProcessManager:
         )
 
     def _on_settled(
-        self, state: ResultPMState, evt: BudgetSettlementCompletedEvt
+        self, state: ResultPMState, evt: BudgetSettlementCompletedEvt, stream_id: str
     ) -> Reaction[ResultPMState, ResultCommand]:
         pending = state.pending_of(evt.operation_id)
         if pending is None or evt.operation_id in state.completed:
             return Reaction(state=state, commands=())
+        meta = state.meta_of(pending.attempt_id)
+        assert meta is not None
+        # owner 屏障:结算必须来自本项目 budget 流(先于内容屏障,拒绝跨项目发布)。
+        identity.require_budget_owner(
+            stream_id=stream_id, project_id=meta.project_id, operation_id=evt.operation_id
+        )
         # 严格屏障:不能仅凭 operation_id 就发布。
         if (
             evt.quote_digest != pending.quote_digest
@@ -241,8 +247,6 @@ class ProviderResultProcessManager:
             raise ContractViolation(
                 f"结算屏障与 pending 不一致:operation={evt.operation_id}"
             )
-        meta = state.meta_of(pending.attempt_id)
-        assert meta is not None
         completed = state.model_copy(
             update={"completed": (*state.completed, evt.operation_id)}
         )

@@ -94,7 +94,7 @@ class ProviderSchedulingProcessManager:
         if isinstance(payload, ProviderExecutionSpecRecordedEvt):
             return self._on_spec_recorded(state, payload)
         if isinstance(payload, BudgetReservedEvt):
-            return self._on_reserved(state, payload)
+            return self._on_reserved(state, payload, event.stream_id)
         if isinstance(payload, ProviderOperationInitiatedEvt):
             return self._on_initiated(state, payload)
         if isinstance(payload, ProviderOperationSubmittedEvt):
@@ -102,7 +102,7 @@ class ProviderSchedulingProcessManager:
         if isinstance(payload, ProviderOperationSubmissionUnknownEvt):
             return self._mark(state, payload.operation_id, provider=False)
         if isinstance(payload, BudgetReservationDeclinedEvt):
-            return self._on_declined(state, payload)
+            return self._on_declined(state, payload, event.stream_id)
         return Reaction(state=state, commands=())
 
     def _on_spec_recorded(
@@ -129,11 +129,18 @@ class ProviderSchedulingProcessManager:
         )
 
     def _on_reserved(
-        self, state: SchedulingState, payload: BudgetReservedEvt
+        self, state: SchedulingState, payload: BudgetReservedEvt, stream_id: str
     ) -> Reaction[SchedulingState, SchedulingCommand]:
         spec = state.spec_of(payload.operation_id)
         if spec is None:
             return Reaction(state=state, commands=())  # 未追踪(不发起)
+        project = state.project_of(spec.attempt_id)
+        if project is None:
+            return Reaction(state=state, commands=())  # owner 未知,不发起
+        # owner 屏障:预留必须来自本项目 budget 流(先于内容指纹,拒绝跨项目串账)。
+        identity.require_budget_owner(
+            stream_id=stream_id, project_id=project, operation_id=payload.operation_id
+        )
         if not _reservation_matches(
             spec, payload.amount, payload.currency, payload.quote_digest
         ):
@@ -204,11 +211,18 @@ class ProviderSchedulingProcessManager:
         )
 
     def _on_declined(
-        self, state: SchedulingState, payload: BudgetReservationDeclinedEvt
+        self, state: SchedulingState, payload: BudgetReservationDeclinedEvt, stream_id: str
     ) -> Reaction[SchedulingState, SchedulingCommand]:
         spec = state.spec_of(payload.operation_id)
         if spec is None:
             return Reaction(state=state, commands=())
+        project = state.project_of(spec.attempt_id)
+        if project is None:
+            return Reaction(state=state, commands=())  # owner 未知,不阻塞
+        # owner 屏障:decline 也必须来自本项目 budget 流,否则跨项目误阻塞。
+        identity.require_budget_owner(
+            stream_id=stream_id, project_id=project, operation_id=payload.operation_id
+        )
         # 与 spec 不一致的 decline 视为错配,忽略以免错误阻塞同 operation。
         if not _reservation_matches(
             spec, payload.amount, payload.currency, payload.quote_digest

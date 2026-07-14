@@ -193,7 +193,7 @@ class OrphanReconciliationProcessManager:
         if isinstance(payload, ProviderExecutionSpecRecordedEvt):
             return self._track(state, payload)
         if isinstance(payload, BudgetReservedEvt):
-            return self._on_reserved(state, payload)
+            return self._on_reserved(state, payload, event.stream_id)
         if isinstance(payload, ProviderOperationInitiatedEvt):
             return Reaction(
                 state=self._patch(
@@ -240,6 +240,13 @@ class OrphanReconciliationProcessManager:
             return self._on_aborted(state, payload)
         if isinstance(payload, BudgetSettlementCompletedEvt):
             if payload.outcome == "released":
+                op = state.op_of(payload.operation_id)
+                # owner 屏障:释放必须来自本项目 budget 流,否则外部墓碑抑制正确释放。
+                if op is not None and op.project_id is not None:
+                    identity.require_budget_owner(
+                        stream_id=event.stream_id, project_id=op.project_id,
+                        operation_id=payload.operation_id,
+                    )
                 return Reaction(
                     state=self._patch(state, payload.operation_id, released=True),
                     commands=(),
@@ -250,11 +257,17 @@ class OrphanReconciliationProcessManager:
         return Reaction(state=state, commands=())
 
     def _on_reserved(
-        self, state: ReconcilerState, payload: BudgetReservedEvt
+        self, state: ReconcilerState, payload: BudgetReservedEvt, stream_id: str
     ) -> Reaction[ReconcilerState, ReconcileCommand]:
         op = state.op_of(payload.operation_id)
         if op is None:
             return Reaction(state=state, commands=())
+        if op.project_id is None:
+            return Reaction(state=state, commands=())  # owner 未知,不确认
+        # owner 屏障:预留必须来自本项目 budget 流,否则跨项目确认 -> 错误释放。
+        identity.require_budget_owner(
+            stream_id=stream_id, project_id=op.project_id, operation_id=payload.operation_id
+        )
         # 只有预留内容与 spec 一致才确认;否则不 reserved(_on_aborted 不会释放)。
         if not _reservation_matches(
             op.spec, payload.amount, payload.currency, payload.quote_digest
