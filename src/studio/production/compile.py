@@ -217,22 +217,32 @@ def compile_from(
             s.stage_id, creqs, out.partitioning.kind, out.partitioning.from_key
         )
 
-        # 分区源可激活性:基于 producer 的输出分区契约交叉校验。
-        if partition_source is not None:
-            src_kind = output_kind[partition_source.producer_stage]
-            if mode is StageMode.FANOUT and src_kind is not PartitioningKind.SINGLETON:
-                raise CompilationError(
-                    f"{s.stage_id}: FANOUT driver 必须来自 singleton producer"
-                    "(暂不支持分区化/嵌套 FANOUT driver)"
-                )
-            if mode is StageMode.PER_PARTITION and src_kind not in (
-                PartitioningKind.DYNAMIC_FROM,
-                PartitioningKind.INHERIT_PARTITION,
+        # 对**每个** Requirement 做对称校验:producer 的输出分区契约必须与
+        # InputAssembler 的运行期查询方式一致,否则会静默死锁。
+        source_key = partition_source.requirement_key if partition_source else None
+        for r in creqs:
+            prod_kind = output_kind[r.producer_stage]
+            is_fanout_driver = mode is StageMode.FANOUT and r.requirement_key == source_key
+            if is_fanout_driver or r.propagation_mode in (
+                PropagationMode.AGGREGATE,
+                PropagationMode.GLOBAL,
             ):
-                raise CompilationError(
-                    f"{s.stage_id}: PER_PARTITION 分区源的 producer 必须产出分区产物"
-                    "(singleton 无法激活分区)"
-                )
+                # 运行期按 None 查询 -> producer 必须是 SINGLETON
+                if prod_kind is not PartitioningKind.SINGLETON:
+                    raise CompilationError(
+                        f"{s.stage_id}: 聚合/driver 输入 {r.requirement_key} "
+                        "的 producer 必须是 singleton(否则永远无法解析)"
+                    )
+            else:
+                # PARTITION_PRESERVING -> 运行期按 partition 查询 -> producer 必须分区化
+                if prod_kind not in (
+                    PartitioningKind.DYNAMIC_FROM,
+                    PartitioningKind.INHERIT_PARTITION,
+                ):
+                    raise CompilationError(
+                        f"{s.stage_id}: 分区保持输入 {r.requirement_key} "
+                        "的 producer 必须产出分区产物(singleton 无法按分区解析)"
+                    )
 
         compiled.append(
             CompiledStage(

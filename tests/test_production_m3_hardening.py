@@ -909,3 +909,62 @@ def test_compiler_rejects_partitioned_fanout_driver() -> None:
     )
     with pytest.raises(CompilationError):
         compile_from(stages)
+
+
+def test_compiler_rejects_partitioned_aggregate_side_input() -> None:
+    # style 被声明为 AGGREGATE,但其 producer 是分区化 FANOUT -> 运行期 resolve(slot,None) 永远失败
+    img = StageSpec(
+        stage_id="img", executor_kind=ExecutorKind.PROVIDER,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.COSTED}), cost_mode=CostMode.METERED,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.IMAGE, logical_slot="plan",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+            Requirement(
+                artifact_type=ArtifactType.IMAGE, logical_slot="style",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.AGGREGATE,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.STITCH, logical_slot="img", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    stages = (
+        _producer_stage("sb", ArtifactType.STORYBOARD, "sb"),
+        _fanout_stage("plan", "plan", ArtifactType.STORYBOARD, "sb", "selP"),
+        _fanout_stage("style", "style", ArtifactType.STORYBOARD, "sb", "selS"),
+        img,
+    )
+    with pytest.raises(CompilationError):
+        compile_from(stages)
+
+
+def test_compiler_rejects_singleton_partition_preserving_side_input() -> None:
+    # PARTITION_PRESERVING 输入指向 singleton producer -> 运行期 resolve(slot,partition) 永远失败
+    consumer = StageSpec(
+        stage_id="consumer", executor_kind=ExecutorKind.PROVIDER,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.COSTED}), cost_mode=CostMode.METERED,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="style",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE, logical_slot="out", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    with pytest.raises(CompilationError):
+        compile_from((_producer_stage("style", ArtifactType.SCRIPT, "style"), consumer))
