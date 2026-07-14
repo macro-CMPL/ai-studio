@@ -61,6 +61,7 @@ from studio.production.payloads import (
     PipelineInitializedEvt,
     ProductionEvent,
     ProposeArtifactVersionCmd,
+    StageExpandedEvt,
     TaskAttemptCreatedEvt,
     TaskInputsBoundEvt,
 )
@@ -658,40 +659,160 @@ def test_compiler_rejects_ambiguous_producer() -> None:
         )
 
 
-def test_compiler_preserves_multi_input_and_stable_digest() -> None:
-    consumer = StageSpec(
-        stage_id="consumer",
-        executor_kind=ExecutorKind.TRANSFORM,
+def _multi_input_stages() -> tuple[StageSpec, ...]:
+    """sb(root) -> plan(fanout) ; style(root) ; img(per-partition: plan 保持 + style 聚合)。"""
+    img = StageSpec(
+        stage_id="img",
+        executor_kind=ExecutorKind.PROVIDER,
         control_role=ControlRole.PRODUCER,
-        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        allowed_tool_effects=frozenset({ToolEffectLevel.COSTED}),
         cost_mode=CostMode.METERED,
         requires=(
             Requirement(
-                artifact_type=ArtifactType.SCRIPT, logical_slot="s1",
+                artifact_type=ArtifactType.IMAGE, logical_slot="plan",
                 cardinality=Cardinality(kind=CardinalityKind.STATIC),
-                propagation_mode=PropagationMode.AGGREGATE,
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
             ),
             Requirement(
-                artifact_type=ArtifactType.STORYBOARD, logical_slot="s2",
+                artifact_type=ArtifactType.SCRIPT, logical_slot="style",
                 cardinality=Cardinality(kind=CardinalityKind.STATIC),
                 propagation_mode=PropagationMode.AGGREGATE,
             ),
         ),
         produces=(
             OutputSpec(
-                artifact_type=ArtifactType.STITCH, logical_slot="out", schema_version=1,
+                artifact_type=ArtifactType.STITCH, logical_slot="img", schema_version=1,
                 partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
             ),
         ),
     )
-    stages = (
-        _producer_stage("p1", ArtifactType.SCRIPT, "s1"),
-        _producer_stage("p2", ArtifactType.STORYBOARD, "s2"),
-        consumer,
+    return (
+        _producer_stage("sb", ArtifactType.STORYBOARD, "sb"),
+        _fanout_stage("plan", "plan", ArtifactType.STORYBOARD, "sb", "selP"),
+        _producer_stage("style", ArtifactType.SCRIPT, "style"),
+        img,
     )
+
+
+def test_compiler_preserves_multi_input_and_stable_digest() -> None:
+    stages = _multi_input_stages()
     spec = compile_from(stages)
-    compiled_consumer = spec.by_stage("consumer")
-    assert compiled_consumer is not None
-    assert len(compiled_consumer.requirements) == 2
-    # 稳定 digest
+    img = spec.by_stage("img")
+    assert img is not None
+    assert len(img.requirements) == 2
     assert compile_from(stages).spec_id == spec.spec_id
+
+
+def _accepted_evt(
+    project: str, slot: str, partition: str | None, revision: int, attempt: str, digest_hex: str
+) -> ArtifactVersionAcceptedEvt:
+    series = domain_ids.series_id(project, slot, partition)
+    return ArtifactVersionAcceptedEvt(
+        project_id=project, series_id=series, revision=revision,
+        artifact_ref=_ref(series, revision, digest_hex), previous_current_ref=None,
+        candidate_id=f"c-{slot}-{partition}", produced_by_attempt=attempt,
+        output_key=slot, partition_key=partition,
+    )
+
+
+def test_assembler_waits_for_all_inputs_multi_input() -> None:
+    spec = compile_from(_multi_input_stages())
+    selectors = {("selP", "1"): lambda p: ("shot_01",)}
+    pm = ExpansionProcessManager(spec, selectors)
+    project = "p"
+    sb_series = domain_ids.series_id(project, "sb", None)
+
+    events: list[ProductionEvent] = [
+        PipelineInitializedEvt(project_id=project, pipeline_spec_id=spec.spec_id),
+        ArtifactCandidateProducedEvt(
+            candidate_id="c-sb", attempt_id="att-sb", project_id=project,
+            series_id=sb_series, output_key="sb", partition_key=None, digest="a" * 64,
+            payload=StoryboardPayload(shots=(ShotSpec(shot_id="shot_01", description="d"),)),
+        ),
+        _accepted_evt(project, "sb", None, 1, "att-sb", "a" * 64),
+        StageExpandedEvt(
+            project_id=project, stage_id="plan",
+            driver_ref=_ref(sb_series, 1, "a" * 64),
+            partitions=("shot_01",),
+            task_keys=(identity.task_key(project, "plan", "shot_01"),),
+        ),
+        # plan[shot_01] 接受(分区源),但 style 尚未接受 -> 不应创建 img
+        _accepted_evt(project, "plan", "shot_01", 1, "att-plan", "b" * 64),
+        # style 聚合输入接受 -> 现在 img[shot_01] 齐备
+        _accepted_evt(project, "style", None, 1, "att-style", "c" * 64),
+    ]
+    commands = _run_pm(pm, events)
+    img_creates = [
+        c.payload
+        for c in commands
+        if isinstance(c.payload, CreateTaskAttemptCmd) and c.payload.stage_id == "img"
+    ]
+    assert len(img_creates) == 1  # 齐备后只创建一次
+    slots = {b.logical_slot for b in img_creates[0].exact_refs}
+    assert slots == {"plan", "style"}  # 两个输入都绑定,不丢 style
+
+
+def test_compiler_rejects_dependency_cycle() -> None:
+    # a 需要 b 的输出,b 需要 a 的输出 -> 环
+    a = StageSpec(
+        stage_id="a", executor_kind=ExecutorKind.TRANSFORM, control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}), cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.STORYBOARD, logical_slot="outb",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="outa", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    b = StageSpec(
+        stage_id="b", executor_kind=ExecutorKind.TRANSFORM, control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}), cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="outa",
+                cardinality=Cardinality(kind=CardinalityKind.STATIC),
+                propagation_mode=PropagationMode.PARTITION_PRESERVING,
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.STORYBOARD, logical_slot="outb", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.INHERIT_PARTITION),
+            ),
+        ),
+    )
+    with pytest.raises(CompilationError):
+        compile_from((a, b))
+
+
+def test_compiler_rejects_partition_contract_mismatch() -> None:
+    # 动态输入(FANOUT)却声明 SINGLETON 输出 -> 契约冲突
+    bad = StageSpec(
+        stage_id="bad", executor_kind=ExecutorKind.AGENT, control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}), cost_mode=CostMode.FREE,
+        requires=(
+            Requirement(
+                artifact_type=ArtifactType.SCRIPT, logical_slot="root",
+                cardinality=Cardinality(
+                    kind=CardinalityKind.DYNAMIC_PARTITION_BY, partition_by="k"
+                ),
+                propagation_mode=PropagationMode.AGGREGATE,
+                partition_selector_id="s", partition_selector_version="1",
+            ),
+        ),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.IMAGE, logical_slot="bad", schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.SINGLETON),  # 应为 DYNAMIC_FROM
+            ),
+        ),
+    )
+    with pytest.raises(CompilationError):
+        compile_from((_producer_stage("root", ArtifactType.SCRIPT, "root"), bad))

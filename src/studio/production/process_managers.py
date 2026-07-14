@@ -9,7 +9,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from studio.domain.artifacts import ArtifactRef
-from studio.domain.enums import AcceptanceMode
+from studio.domain.enums import AcceptanceMode, PropagationMode
 from studio.kernel.envelopes import EventEnvelope
 from studio.kernel.process_manager import ProposedCommand, Reaction
 
@@ -132,6 +132,8 @@ class ProjectExpansion(BaseModel):
     project_id: str
     partition_cache: tuple[PartitionCacheEntry, ...] = ()
     accepted: tuple[AcceptedRefEntry, ...] = ()
+    activated: tuple[tuple[str, str], ...] = ()  # (stage_id, partition) 分区源已就绪
+    created: tuple[tuple[str, str], ...] = ()  # (stage_id, partition) 已发起创建
 
     def partitions(self, candidate_id: str, stage_id: str) -> tuple[str, ...]:
         return next(
@@ -142,6 +144,22 @@ class ProjectExpansion(BaseModel):
             ),
             (),
         )
+
+    def resolve(self, output_key: str, partition: str | None) -> ArtifactRef | None:
+        return next(
+            (
+                e.ref
+                for e in self.accepted
+                if e.output_key == output_key and e.partition_key == partition
+            ),
+            None,
+        )
+
+    def activated_partitions(self, stage_id: str) -> tuple[str, ...]:
+        return tuple(p for (sid, p) in self.activated if sid == stage_id)
+
+    def is_created(self, stage_id: str, partition: str) -> bool:
+        return (stage_id, partition) in self.created
 
 
 class ExpansionState(BaseModel):
@@ -160,6 +178,11 @@ class ExpansionState(BaseModel):
 
 
 class ExpansionProcessManager:
+    """按 CompiledPipelineSpec 展开;内含 InputAssembler。
+
+    齐备**所有** Requirement 后才创建 Attempt(多输入不丢)。
+    """
+
     pm_id = "expansion-pm"
 
     def __init__(
@@ -171,15 +194,13 @@ class ExpansionProcessManager:
         self._selectors = selectors
         # fail fast:每个 FANOUT 阶段声明的 selector (id, version) 必须已注册。
         for stage in spec.stages:
-            if stage.mode is StageMode.FANOUT and stage.driver_requirement is not None:
+            if stage.mode is StageMode.FANOUT and stage.partition_source is not None:
                 key = (
-                    stage.driver_requirement.partition_selector_id,
-                    stage.driver_requirement.partition_selector_version,
+                    stage.partition_source.partition_selector_id,
+                    stage.partition_source.partition_selector_version,
                 )
-                if key[0] is None or key[1] is None or (key[0], key[1]) not in selectors:
-                    raise ValueError(
-                        f"stage {stage.stage_id} 的 selector {key} 未注册"
-                    )
+                if key[0] is None or key[1] is None or key not in selectors:
+                    raise ValueError(f"stage {stage.stage_id} 的 selector {key} 未注册")
 
     def initial_state(self) -> ExpansionState:
         return ExpansionState()
@@ -202,14 +223,11 @@ class ExpansionProcessManager:
         self, state: ExpansionState, payload: PipelineInitializedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
         if payload.pipeline_spec_id != self._spec.spec_id:
-            return Reaction(state=state, commands=())  # 非本 spec 管辖
+            return Reaction(state=state, commands=())
         commands: list[ProposedCommand[ProductionCommand]] = []
         for stage in self._spec.root_stages():
             aid, cmd = _create_attempt(
-                project_id=payload.project_id,
-                stage=stage,
-                partition_key=None,
-                bindings=(),
+                project_id=payload.project_id, stage=stage, partition_key=None, bindings=()
             )
             commands.append(
                 ProposedCommand(
@@ -219,22 +237,21 @@ class ExpansionProcessManager:
                     payload=cmd,
                 )
             )
-        new_project = state.project(payload.project_id)
-        return Reaction(state=state.with_project(new_project), commands=tuple(commands))
+        return Reaction(
+            state=state.with_project(state.project(payload.project_id)),
+            commands=tuple(commands),
+        )
 
     def _cache_partitions(
         self, state: ExpansionState, payload: ArtifactCandidateProducedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
-        # 只有作为某 FANOUT 阶段 driver 的 candidate 才用其 selector 提取分区,
-        # 并**按 candidate_id 缓存**(避免乱序接受时绑定到别的 candidate 的分区)。
         fanouts = self._spec.fanout_driven_by(payload.output_key)
         if not fanouts:
             return Reaction(state=state, commands=())
         proj = state.project(payload.project_id)
         new_entries: list[PartitionCacheEntry] = []
-        # 每个 FANOUT 阶段用**各自**的 selector,缓存键 (candidate_id, stage_id)。
         for stage in fanouts:
-            req = stage.driver_requirement
+            req = stage.partition_source
             assert req is not None
             selector = self._selectors[
                 (req.partition_selector_id, req.partition_selector_version)  # type: ignore[index]
@@ -259,16 +276,21 @@ class ExpansionProcessManager:
         self, state: ExpansionState, payload: ArtifactVersionAcceptedEvt
     ) -> Reaction[ExpansionState, ProductionCommand]:
         proj = state.project(payload.project_id)
-        entry = AcceptedRefEntry(
-            output_key=payload.output_key,
-            partition_key=payload.partition_key,
-            ref=payload.artifact_ref,
+        proj = proj.model_copy(
+            update={
+                "accepted": (
+                    *proj.accepted,
+                    AcceptedRefEntry(
+                        output_key=payload.output_key,
+                        partition_key=payload.partition_key,
+                        ref=payload.artifact_ref,
+                    ),
+                )
+            }
         )
-        proj = proj.model_copy(update={"accepted": (*proj.accepted, entry)})
-        new_state = state.with_project(proj)
         commands: list[ProposedCommand[ProductionCommand]] = []
 
-        # FANOUT:本产物是某扇出阶段的 driver;分区取自 (candidate, stage) 的缓存
+        # FANOUT:本产物是扇出 driver -> 发 ExpandStage(两步展开)
         for stage in self._spec.fanout_driven_by(payload.output_key):
             partitions = tuple(
                 sorted(set(proj.partitions(payload.candidate_id, stage.stage_id)))
@@ -294,32 +316,33 @@ class ExpansionProcessManager:
                 )
             )
 
-        # PER_PARTITION:本产物直接喂下游 1:1 阶段
-        for stage in self._spec.per_partition_fed_by(payload.output_key):
-            req = stage.upstream_requirement
-            assert req is not None
-            binding = BindingItem.from_ref(
-                requirement_key=req.requirement_key,
-                logical_slot=req.logical_slot,
-                partition_key=payload.partition_key,
-                ref=payload.artifact_ref,
-                propagation_mode=req.propagation_mode,
-            )
-            aid, cmd = _create_attempt(
-                project_id=payload.project_id,
-                stage=stage,
-                partition_key=payload.partition_key,
-                bindings=(binding,),
-            )
-            commands.append(
-                ProposedCommand(
-                    reaction_name=f"create:{stage.stage_id}",
-                    command_key=f"create:{aid}",
-                    target=identity.attempt_stream(aid),
-                    payload=cmd,
+        # 输入装配:该产物可能完成某些下游 join
+        for stage, req in self._spec.consumers_of(payload.output_key):
+            if (
+                stage.mode is StageMode.PER_PARTITION
+                and stage.partition_source is not None
+                and req.requirement_key == stage.partition_source.requirement_key
+                and payload.partition_key is not None
+            ):
+                # 分区源到达:激活该分区并尝试装配
+                proj = proj.model_copy(
+                    update={
+                        "activated": (
+                            *proj.activated,
+                            (stage.stage_id, payload.partition_key),
+                        )
+                    }
                 )
-            )
-        return Reaction(state=new_state, commands=tuple(commands))
+                candidate_partitions: tuple[str, ...] = (payload.partition_key,)
+            else:
+                # 聚合/侧输入到达:重试所有已激活分区
+                candidate_partitions = proj.activated_partitions(stage.stage_id)
+            for p in candidate_partitions:
+                proj, cmd = self._try_create(proj, payload.project_id, stage, p)
+                if cmd is not None:
+                    commands.append(cmd)
+
+        return Reaction(state=state.with_project(proj), commands=tuple(commands))
 
     def _on_stage_expanded(
         self, state: ExpansionState, payload: StageExpandedEvt
@@ -327,32 +350,65 @@ class ExpansionProcessManager:
         stage = self._spec.by_stage(payload.stage_id)
         if stage is None or stage.mode is not StageMode.FANOUT:
             return Reaction(state=state, commands=())
-        req = stage.driver_requirement
-        assert req is not None
+        proj = state.project(payload.project_id)
         commands: list[ProposedCommand[ProductionCommand]] = []
         for partition in payload.partitions:
-            binding = BindingItem.from_ref(
-                requirement_key=req.requirement_key,
-                logical_slot=req.logical_slot,
-                partition_key=partition,
-                ref=payload.driver_ref,  # 用事件中的 driver_ref,绑定正确版本
-                propagation_mode=req.propagation_mode,
+            proj = proj.model_copy(
+                update={"activated": (*proj.activated, (stage.stage_id, partition))}
             )
-            aid, cmd = _create_attempt(
-                project_id=payload.project_id,
-                stage=stage,
-                partition_key=partition,
-                bindings=(binding,),
+            proj, cmd = self._try_create(proj, payload.project_id, stage, partition)
+            if cmd is not None:
+                commands.append(cmd)
+        return Reaction(state=state.with_project(proj), commands=tuple(commands))
+
+    def _try_create(
+        self,
+        proj: ProjectExpansion,
+        project_id: str,
+        stage: CompiledStage,
+        partition: str,
+    ) -> tuple[ProjectExpansion, ProposedCommand[ProductionCommand] | None]:
+        if proj.is_created(stage.stage_id, partition):
+            return proj, None
+        bindings: list[BindingItem] = []
+        for r in stage.requirements:
+            is_source = (
+                stage.partition_source is not None
+                and r.requirement_key == stage.partition_source.requirement_key
             )
-            commands.append(
-                ProposedCommand(
-                    reaction_name=f"create:{stage.stage_id}:{partition}",
-                    command_key=f"create:{aid}",
-                    target=identity.attempt_stream(aid),
-                    payload=cmd,
+            if stage.mode is StageMode.FANOUT and is_source:
+                ref = proj.resolve(r.logical_slot, None)  # driver 为聚合/singleton
+            elif r.propagation_mode is PropagationMode.PARTITION_PRESERVING:
+                ref = proj.resolve(r.logical_slot, partition)
+            else:
+                ref = proj.resolve(r.logical_slot, None)
+            if ref is None:
+                return proj, None  # 尚未齐备
+            bindings.append(
+                BindingItem.from_ref(
+                    requirement_key=r.requirement_key,
+                    logical_slot=r.logical_slot,
+                    partition_key=partition,
+                    ref=ref,
+                    propagation_mode=r.propagation_mode,
                 )
             )
-        return Reaction(state=state, commands=tuple(commands))
+        aid, cmd = _create_attempt(
+            project_id=project_id,
+            stage=stage,
+            partition_key=partition,
+            bindings=tuple(bindings),
+        )
+        proj = proj.model_copy(
+            update={"created": (*proj.created, (stage.stage_id, partition))}
+        )
+        command: ProposedCommand[ProductionCommand] = ProposedCommand(
+            reaction_name=f"create:{stage.stage_id}:{partition}",
+            command_key=f"create:{aid}",
+            target=identity.attempt_stream(aid),
+            payload=cmd,
+        )
+        return proj, command
 
 
 # --------------------------------------------------------------------------- #

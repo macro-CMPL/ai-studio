@@ -2,9 +2,13 @@
 
 编译器负责:
 - 按 (artifact_type, logical_slot) 唯一解析 producer;缺失或歧义则拒绝。
-- 保留多输入 Requirement 与 executor/control/cost/effect 元数据。
-- 判定 stage 模式(ROOT_SINGLETON / FANOUT / PER_PARTITION)。
-- 绑定 partition selector(id + version)与 propagation。
+- 依赖图拓扑校验(拒绝自环与间接环)。
+- 判定 stage 模式,并对分区契约做交叉校验:
+  ROOT_SINGLETON 输出必须 SINGLETON;
+  FANOUT 恰好一个动态 driver,输出必须 DYNAMIC_FROM 且 from_key 匹配 partition_by;
+  PER_PARTITION 输出必须 INHERIT_PARTITION,且恰好一个 PARTITION_PRESERVING 输入作为分区源;
+  非动态 Requirement 不得残留 selector 字段。
+- 保留完整输出契约与多输入 Requirement、executor/control/cost/effect 元数据。
 - 规范排序,计算包含 compiler_version 的稳定 spec_id。
 """
 
@@ -65,11 +69,14 @@ class CompiledStage(BaseModel):
     control_role: ControlRole
     cost_mode: CostMode
     allowed_tool_effects: tuple[ToolEffectLevel, ...]
+    output_artifact_type: ArtifactType
+    output_schema_version: int
+    output_partitioning_kind: PartitioningKind
+    output_from_key: str | None
     requirements: tuple[CompiledRequirement, ...]
+    partition_source: CompiledRequirement | None
     driver_stage: str | None
     upstream_stage: str | None
-    driver_requirement: CompiledRequirement | None
-    upstream_requirement: CompiledRequirement | None
 
 
 class CompiledPipelineSpec(BaseModel):
@@ -105,20 +112,51 @@ class CompiledPipelineSpec(BaseModel):
             if s.mode is StageMode.FANOUT and s.driver_stage == producer.stage_id
         )
 
-    def per_partition_fed_by(self, output_key: str) -> tuple[CompiledStage, ...]:
-        producer = self.by_output(output_key)
-        if producer is None:
-            return ()
-        return tuple(
-            s
-            for s in self.stages
-            if s.mode is StageMode.PER_PARTITION
-            and s.upstream_stage == producer.stage_id
-        )
+    def consumers_of(
+        self, output_key: str
+    ) -> tuple[tuple[CompiledStage, CompiledRequirement], ...]:
+        """所有以 output_key 为输入的 (stage, requirement)。"""
+        out: list[tuple[CompiledStage, CompiledRequirement]] = []
+        for s in self.stages:
+            for r in s.requirements:
+                if r.logical_slot == output_key:
+                    out.append((s, r))
+        return tuple(out)
 
 
 def _requirement_key(req: Requirement) -> str:
     return f"{req.artifact_type.value}:{req.logical_slot}"
+
+
+def _resolve_producers(stages: tuple[StageSpec, ...]) -> dict[tuple[ArtifactType, str], str]:
+    index: dict[tuple[ArtifactType, str], list[str]] = {}
+    for s in stages:
+        for out in s.produces:
+            index.setdefault((out.artifact_type, out.logical_slot), []).append(s.stage_id)
+    resolved: dict[tuple[ArtifactType, str], str] = {}
+    for key, owners in index.items():
+        if len(owners) > 1:
+            raise CompilationError(f"{key} 的 producer 歧义:{owners}")
+        resolved[key] = owners[0]
+    return resolved
+
+
+def _assert_acyclic(edges: dict[str, set[str]]) -> None:
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = dict.fromkeys(edges, WHITE)
+
+    def visit(node: str) -> None:
+        color[node] = GRAY
+        for nxt in sorted(edges.get(node, set())):
+            if color[nxt] == GRAY:
+                raise CompilationError("pipeline 依赖图存在环")
+            if color[nxt] == WHITE:
+                visit(nxt)
+        color[node] = BLACK
+
+    for node in sorted(edges):
+        if color[node] == WHITE:
+            visit(node)
 
 
 def compile_from(
@@ -130,13 +168,8 @@ def compile_from(
     if len(set(stage_ids)) != len(stage_ids):
         raise CompilationError("stage_id 必须唯一")
 
-    # (artifact_type, logical_slot) -> [stage_id],用于解析 producer
-    producers: dict[tuple[ArtifactType, str], list[str]] = {}
-    for s in stages:
-        for out in s.produces:
-            producers.setdefault((out.artifact_type, out.logical_slot), []).append(
-                s.stage_id
-            )
+    producers = _resolve_producers(stages)
+    edges: dict[str, set[str]] = {s.stage_id: set() for s in stages}
 
     compiled: list[CompiledStage] = []
     for s in stages:
@@ -146,21 +179,24 @@ def compile_from(
 
         creqs: list[CompiledRequirement] = []
         for req in s.requires:
-            owners = producers.get((req.artifact_type, req.logical_slot), [])
-            if not owners:
+            owner = producers.get((req.artifact_type, req.logical_slot))
+            if owner is None:
                 raise CompilationError(
                     f"{s.stage_id}: 找不到 {req.artifact_type}/{req.logical_slot} 的 producer"
                 )
-            if len(owners) > 1:
+            if req.cardinality.kind is not CardinalityKind.DYNAMIC_PARTITION_BY and (
+                req.partition_selector_id or req.partition_selector_version
+            ):
                 raise CompilationError(
-                    f"{s.stage_id}: {req.artifact_type}/{req.logical_slot} 的 producer 歧义"
+                    f"{s.stage_id}: 非动态 Requirement 不得携带 selector"
                 )
+            edges[owner].add(s.stage_id)
             creqs.append(
                 CompiledRequirement(
                     requirement_key=_requirement_key(req),
                     artifact_type=req.artifact_type,
                     logical_slot=req.logical_slot,
-                    producer_stage=owners[0],
+                    producer_stage=owner,
                     cardinality_kind=req.cardinality.kind,
                     partition_by=req.cardinality.partition_by,
                     propagation_mode=req.propagation_mode,
@@ -171,26 +207,9 @@ def compile_from(
             )
         creqs.sort(key=lambda r: r.requirement_key)
 
-        driver_req = next(
-            (r for r in creqs if r.cardinality_kind is CardinalityKind.DYNAMIC_PARTITION_BY),
-            None,
+        mode, partition_source, driver_stage, upstream_stage = _classify(
+            s.stage_id, creqs, out.partitioning.kind, out.partitioning.from_key
         )
-        if not creqs:
-            mode = StageMode.ROOT_SINGLETON
-            driver_stage = upstream_stage = None
-            upstream_req = None
-        elif driver_req is not None:
-            mode = StageMode.FANOUT
-            driver_stage = driver_req.producer_stage
-            upstream_stage = None
-            upstream_req = None
-        elif out.partitioning.kind is PartitioningKind.INHERIT_PARTITION:
-            mode = StageMode.PER_PARTITION
-            upstream_req = creqs[0]
-            upstream_stage = upstream_req.producer_stage
-            driver_stage = None
-        else:
-            raise CompilationError(f"{s.stage_id}: 无法判定 stage 模式")
 
         compiled.append(
             CompiledStage(
@@ -204,20 +223,60 @@ def compile_from(
                 allowed_tool_effects=tuple(
                     sorted(s.allowed_tool_effects, key=lambda e: e.value)
                 ),
+                output_artifact_type=out.artifact_type,
+                output_schema_version=out.schema_version,
+                output_partitioning_kind=out.partitioning.kind,
+                output_from_key=out.partitioning.from_key,
                 requirements=tuple(creqs),
+                partition_source=partition_source,
                 driver_stage=driver_stage,
                 upstream_stage=upstream_stage,
-                driver_requirement=driver_req,
-                upstream_requirement=upstream_req,
             )
         )
 
-    # output_key 唯一性
     outs = [c.output_key for c in compiled]
     if len(set(outs)) != len(outs):
         raise CompilationError("output_key(logical_slot)必须唯一")
 
+    _assert_acyclic(edges)
     compiled.sort(key=lambda c: c.stage_id)
-    return CompiledPipelineSpec(
-        compiler_version=compiler_version, stages=tuple(compiled)
-    )
+    return CompiledPipelineSpec(compiler_version=compiler_version, stages=tuple(compiled))
+
+
+def _classify(
+    stage_id: str,
+    creqs: list[CompiledRequirement],
+    out_kind: PartitioningKind,
+    out_from_key: str | None,
+) -> tuple[StageMode, CompiledRequirement | None, str | None, str | None]:
+    dyn = [r for r in creqs if r.cardinality_kind is CardinalityKind.DYNAMIC_PARTITION_BY]
+  
+    preserving = [
+        r for r in creqs if r.propagation_mode is PropagationMode.PARTITION_PRESERVING
+    ]
+
+    if not creqs:
+        if out_kind is not PartitioningKind.SINGLETON:
+            raise CompilationError(f"{stage_id}: ROOT 输出必须是 SINGLETON")
+        return StageMode.ROOT_SINGLETON, None, None, None
+
+    if dyn:
+        if len(dyn) != 1:
+            raise CompilationError(f"{stage_id}: FANOUT 只能有一个动态 driver")
+        driver = dyn[0]
+        if out_kind is not PartitioningKind.DYNAMIC_FROM or out_from_key != driver.partition_by:
+            raise CompilationError(
+                f"{stage_id}: FANOUT 输出必须 DYNAMIC_FROM 且 from_key 匹配 driver.partition_by"
+            )
+        return StageMode.FANOUT, driver, driver.producer_stage, None
+
+    if out_kind is not PartitioningKind.INHERIT_PARTITION:
+        raise CompilationError(
+            f"{stage_id}: 消费型 stage 输出必须 INHERIT_PARTITION(PER_PARTITION)"
+        )
+    if len(preserving) != 1:
+        raise CompilationError(
+            f"{stage_id}: PER_PARTITION 需要恰好一个 PARTITION_PRESERVING 输入作为分区源"
+        )
+    source = preserving[0]
+    return StageMode.PER_PARTITION, source, None, source.producer_stage
