@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from fake_provider import FakeProvider
 from kernel_helpers import FakeClock
 from production_helpers import _plan_exec, _storyboard_exec
 from studio.application.driver import Driver, SupportsPumpTick
@@ -24,6 +25,7 @@ from studio.infrastructure.memory.unit_of_work import (
 )
 from studio.kernel.envelopes import CommandEnvelope
 from studio.production import identity
+from studio.production.activity_worker import ProviderActivityWorker
 from studio.production.attempt import TaskAttemptDecider
 from studio.production.budget import BudgetDecider, InitializeBudgetCmd
 from studio.production.dispatch import canonical_target
@@ -62,6 +64,7 @@ from studio.production.result_mapper import default_result_mappers
 from studio.production.result_pm import ProviderResultProcessManager
 from studio.production.scheduling_pm import ProviderSchedulingProcessManager
 from studio.production.series import ArtifactSeriesDecider
+from studio.production.webhook_ingress import ProviderWebhookIngress
 
 _TS = datetime(2026, 1, 1, tzinfo=UTC)
 _UNIT_COST = Decimal("10")
@@ -89,6 +92,8 @@ class M4Stack:
     clock: FakeClock
     uow_factory: MemoryUnitOfWorkFactory
     driver: Driver
+    provider: FakeProvider | None = None
+    webhook: ProviderWebhookIngress | None = None
 
 
 def build_m4_stack() -> M4Stack:
@@ -134,6 +139,62 @@ def build_m4_stack() -> M4Stack:
     relay = OutboxRelay(uow_factory=factory, bus=bus)
     driver = Driver(worker=worker, pumps=pumps, relay=relay)
     return M4Stack(db=db, bus=bus, clock=clock, uow_factory=factory, driver=driver)
+
+
+def build_activity_stack(provider: FakeProvider | None = None) -> M4Stack:
+    """完整 M4 stack + ProviderActivityWorker(真实 FakeProvider I/O)+ webhook 入口。
+
+    与 build_m4_stack 相同的 Decider/PM,额外挂上第 4 tick(ActivityWorker)。
+    """
+    prov = provider or FakeProvider()
+    db = MemoryDatabase()
+    bus = MemoryCommandBus()
+    clock = FakeClock()
+    factory = MemoryUnitOfWorkFactory(db)
+
+    deciders = {
+        "project": ProjectDecider(),
+        "attempt": TaskAttemptDecider(
+            golden_compiled(),
+            {"storyboard": _storyboard_exec, "plan": _plan_exec},
+        ),
+        "artifact-series": ArtifactSeriesDecider(),
+        "budget": BudgetDecider(),
+        "provider-op": ProviderOperationDecider(),
+        "reconciliation": ReconciliationClockDecider(),
+    }
+    worker = RoutingCommandWorker(
+        deciders=deciders,
+        resolve_kind=identity.stream_kind,
+        canonical_target=canonical_target,
+        bus=bus,
+        uow_factory=factory,
+        clock=clock,
+    )
+
+    def pump(pm: object) -> EventPump[object, object, object]:
+        return EventPump(process_manager=pm, uow_factory=factory, clock=clock)  # type: ignore[arg-type]
+
+    pumps: list[SupportsPumpTick] = [
+        pump(PublishProcessManager()),
+        pump(ExpansionProcessManager(golden_compiled(), golden_selectors())),
+        pump(LineageProcessManager()),
+        pump(RecomputeProcessManager()),
+        pump(ExecutionPlanningProcessManager(golden_compiled(), _BINDINGS, _quote)),
+        pump(ProviderSchedulingProcessManager()),
+        pump(ProviderResultProcessManager(golden_compiled(), default_result_mappers())),
+        pump(_RECONCILE),
+    ]
+    relay = OutboxRelay(uow_factory=factory, bus=bus)
+    activity = ProviderActivityWorker(
+        provider=prov, bus=bus, uow_factory=factory, clock=clock
+    )
+    driver = Driver(worker=worker, pumps=pumps, relay=relay, activity=[activity])
+    ingress = ProviderWebhookIngress(bus=bus, clock=clock)
+    return M4Stack(
+        db=db, bus=bus, clock=clock, uow_factory=factory, driver=driver,
+        provider=prov, webhook=ingress,
+    )
 
 
 def _cmd(target: str, key: str, payload: object, cid: str) -> CommandEnvelope[object]:

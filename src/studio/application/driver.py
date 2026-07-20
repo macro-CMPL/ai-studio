@@ -29,17 +29,27 @@ class Driver:
         worker: SupportsTick,
         pumps: Sequence[SupportsPumpTick],
         relay: SupportsTick,
+        activity: Sequence[SupportsTick] = (),
     ) -> None:
         self._worker = worker
         # 按 pm_id 排序,保证确定性遍历。
         self._pumps = sorted(pumps, key=lambda p: p.pm_id)
         self._relay = relay
+        # Activity worker(s):唯一做外部 I/O 的 tick,放在 relay 之后,
+        # 其产出的命令下一轮由 worker 处理(阶段间保留崩溃边界)。
+        self._activity = tuple(activity)
 
     def tick_round(self) -> bool:
         worker_progress = self._worker.tick()
         pump_results = [pump.tick() for pump in self._pumps]
         relay_progress = self._relay.tick()
-        return worker_progress or any(pump_results) or relay_progress
+        activity_results = [a.tick() for a in self._activity]
+        return (
+            worker_progress
+            or any(pump_results)
+            or relay_progress
+            or any(activity_results)
+        )
 
     def run_until_quiescent(self, max_rounds: int = 10_000) -> int:
         rounds = 0
