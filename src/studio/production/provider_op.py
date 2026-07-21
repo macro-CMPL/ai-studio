@@ -372,7 +372,13 @@ class ProviderOperationDecider:
             raise IdempotencyConflict(cmd.operation_id, "SUCCEEDED result/cost 不一致")
         if state.status in _TERMINAL:
             raise IdempotencyConflict(cmd.operation_id, f"已处于终态 {state.status}")
-        if state.status not in (ProviderOpStatus.SUBMITTED, ProviderOpStatus.SUBMISSION_UNKNOWN):
+        # 可信终态(webhook/poll)可直接自 CLAIMED 收敛:终态证明已接单且已完成,
+        # 避免 RecordSubmitted 落库前 webhook 先到被永久 REJECTED。
+        if state.status not in (
+            ProviderOpStatus.CLAIMED,
+            ProviderOpStatus.SUBMITTED,
+            ProviderOpStatus.SUBMISSION_UNKNOWN,
+        ):
             return Rejected("bad_transition", f"succeeded 不允许自 {state.status}")
         return Accepted(
             (
@@ -415,7 +421,12 @@ class ProviderOperationDecider:
             raise IdempotencyConflict(cmd.operation_id, "FAILED charged/cost 不一致")
         if state.status in _TERMINAL:
             raise IdempotencyConflict(cmd.operation_id, f"已处于终态 {state.status}")
-        if state.status not in (ProviderOpStatus.SUBMITTED, ProviderOpStatus.SUBMISSION_UNKNOWN):
+        # 可信终态可直接自 CLAIMED 收敛(见 _succeeded)。
+        if state.status not in (
+            ProviderOpStatus.CLAIMED,
+            ProviderOpStatus.SUBMITTED,
+            ProviderOpStatus.SUBMISSION_UNKNOWN,
+        ):
             return Rejected("bad_transition", f"failed 不允许自 {state.status}")
         return Accepted(
             (

@@ -8,12 +8,14 @@ dependencies = [
     "pydantic>=2.7",
 ]
 
+# 质量门工具锁定上界:保证 pytest/ruff/mypy strict 结果可复现,
+# 避免未来不兼容大版本(如 mypy 2.x)引入 internal error 或规则漂移。
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.5",
-    "mypy>=1.10",
+    "pytest>=8.0,<10",
+    "pytest-asyncio>=0.23,<2",
+    "ruff>=0.5,<0.16",
+    "mypy>=1.10,<2",
 ]
 
 [build-system]

@@ -56,7 +56,9 @@ class FakeProvider:
     ambiguous_all: bool = False
     retryable_all: bool = False
     pending_first_poll_all: bool = False
+    pending_always: bool = False
     fail_all: bool = False
+    strict_non_idempotent: bool = False  # submit 每次都计费/建新 job(严格非幂等替身)
     retry_after: timedelta = timedelta(hours=1)
 
     _jobs: dict[str, _Job] = field(default_factory=dict)
@@ -80,14 +82,21 @@ class FakeProvider:
         if self._is_retryable(idempotency_key):
             raise RetryableBeforeSendError(idempotency_key)
         # 幂等:同 key 只建一次 job、只计费一次。
-        if idempotency_key not in self._jobs:
+        # strict_non_idempotent:每次 submit 都计费并建新 job(暴露盲目重提的双扣费)。
+        if self.strict_non_idempotent or idempotency_key not in self._jobs:
+            n = self.charges.get(idempotency_key, 0) + 1
+            job_id = (
+                f"job-{idempotency_key}-{n}"
+                if self.strict_non_idempotent
+                else f"job-{idempotency_key}"
+            )
             job = _Job(
-                job_id=f"job-{idempotency_key}", key=idempotency_key,
+                job_id=job_id, key=idempotency_key,
                 cost=request.expected_cost, currency=request.currency,
             )
             self._jobs[idempotency_key] = job
             self._by_job_id[job.job_id] = job
-            self.charges[idempotency_key] = self.charges.get(idempotency_key, 0) + 1
+            self.charges[idempotency_key] = n
         if self._is_ambiguous(idempotency_key):
             raise AmbiguousSubmissionError(idempotency_key)
         job = self._jobs[idempotency_key]
@@ -102,6 +111,8 @@ class FakeProvider:
     def poll(self, job_id: str) -> PollResult:
         job = self._by_job_id[job_id]
         self._poll_count[job_id] = self._poll_count.get(job_id, 0) + 1
+        if self.pending_always:
+            return PollPending(retry_after=self.retry_after)
         if self._is_pending_first(job.key) and self._poll_count[job_id] == 1:
             return PollPending(retry_after=self.retry_after)
         if self._is_fail(job.key):

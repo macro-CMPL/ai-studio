@@ -54,6 +54,7 @@ from studio.production.provider_op import (
     RecordSubmittedCmd,
     RecordSucceededCmd,
 )
+from studio.production.provider_port import ProviderRegistry
 from studio.production.reconcile import (
     EmitReconciliationTickCmd,
     OrphanReconciliationProcessManager,
@@ -74,9 +75,11 @@ _SCOPE = "global"
 _RECONCILE = OrphanReconciliationProcessManager(
     ReconcilePolicy(version=_POLICY_VERSION, recycle_after=timedelta(minutes=10))
 )
+_PROVIDER_ID = "fake-image"
+_PROVIDER_VERSION = "1"
 _BINDINGS = {
     "image": ProviderBinding(
-        provider_id="fake-image", provider_version="1", pricing_version="1"
+        provider_id=_PROVIDER_ID, provider_version=_PROVIDER_VERSION, pricing_version="1"
     )
 }
 
@@ -186,11 +189,12 @@ def build_activity_stack(provider: FakeProvider | None = None) -> M4Stack:
         pump(_RECONCILE),
     ]
     relay = OutboxRelay(uow_factory=factory, bus=bus)
+    registry = ProviderRegistry({(_PROVIDER_ID, _PROVIDER_VERSION): prov})
     activity = ProviderActivityWorker(
-        provider=prov, bus=bus, uow_factory=factory, clock=clock
+        registry=registry, bus=bus, uow_factory=factory, clock=clock
     )
     driver = Driver(worker=worker, pumps=pumps, relay=relay, activity=[activity])
-    ingress = ProviderWebhookIngress(bus=bus, clock=clock)
+    ingress = ProviderWebhookIngress(bus=bus, uow_factory=factory, clock=clock)
     return M4Stack(
         db=db, bus=bus, clock=clock, uow_factory=factory, driver=driver,
         provider=prov, webhook=ingress,

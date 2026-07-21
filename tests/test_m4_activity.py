@@ -47,7 +47,12 @@ from studio.production.provider_op import (
     ProviderOperationDecider,
     ProviderOperationSubmissionUnknownEvt,
 )
-from studio.production.provider_port import ProviderRequest
+from studio.production.provider_port import (
+    ProviderCapabilities,
+    ProviderRegistry,
+    ProviderRequest,
+)
+from studio.production.webhook_ingress import ProviderWebhookIngress
 from studio.serialization import digest
 
 _PROJECT = "p"
@@ -71,7 +76,9 @@ def _accepted(stack: object, output_key: str) -> list[ArtifactVersionAcceptedEvt
     ]
 
 
-def _make_spec(attempt_id: str, shot: str) -> ProviderExecutionSpec:
+def _make_spec(
+    attempt_id: str, shot: str, *, provider_id: str = "fake", provider_version: str = "1"
+) -> ProviderExecutionSpec:
     series = domain_ids.series_id(_PROJECT, "plan", shot)
     plan_payload = ImagePlanPayload(
         operations=(
@@ -92,8 +99,8 @@ def _make_spec(attempt_id: str, shot: str) -> ProviderExecutionSpec:
         attempt_id=attempt_id,
         plan_ref=plan_ref,
         plan_payload=plan_payload,
-        provider_id="fake",
-        provider_version="1",
+        provider_id=provider_id,
+        provider_version=provider_version,
         estimated_cost=Decimal("10"),
         currency="CNY",
         pricing_version="1",
@@ -115,29 +122,37 @@ def _request(spec: ProviderExecutionSpec) -> ProviderRequest:
 class _OpHarness:
     """provider-op 流 + ActivityWorker 的最小手动 tick 装配(不含完整流水线)。"""
 
-    def __init__(self, provider: FakeProvider) -> None:
+    def __init__(
+        self,
+        provider: FakeProvider,
+        *,
+        registry: ProviderRegistry | None = None,
+        clock: object | None = None,
+    ) -> None:
         self.db = MemoryDatabase()
         self.bus = MemoryCommandBus()
-        self.clock = FakeClock()
+        self.clock = clock or FakeClock()  # type: ignore[assignment]
         self.factory = MemoryUnitOfWorkFactory(self.db)
         self.provider = provider
+        self.registry = registry or ProviderRegistry({("fake", "1"): provider})
         self.worker = RoutingCommandWorker(
             deciders={"provider-op": ProviderOperationDecider()},
             resolve_kind=identity.stream_kind,
             canonical_target=canonical_target,
             bus=self.bus,
             uow_factory=self.factory,
-            clock=self.clock,
+            clock=self.clock,  # type: ignore[arg-type]
         )
         self.activity = ProviderActivityWorker(
-            provider=provider, bus=self.bus, uow_factory=self.factory, clock=self.clock
+            registry=self.registry, bus=self.bus, uow_factory=self.factory,
+            clock=self.clock,  # type: ignore[arg-type]
         )
 
     def new_worker(self) -> ProviderActivityWorker:
         """模拟进程重启:全新 ActivityWorker(空内存簿记)。"""
         return ProviderActivityWorker(
-            provider=self.provider, bus=self.bus, uow_factory=self.factory,
-            clock=self.clock,
+            registry=self.registry, bus=self.bus, uow_factory=self.factory,
+            clock=self.clock,  # type: ignore[arg-type]
         )
 
     def drain_worker(self) -> None:
@@ -354,3 +369,189 @@ def test_poll_fairness_rotates_across_ops() -> None:
         assert h.op_status(op) is ProviderOpStatus.SUBMITTED
         assert provider.charge_count(op) == 1
         assert provider.poll_count_for(op) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 8. Blocker 1:owner/routing barrier —— 只路由到匹配 (provider_id, version)
+# --------------------------------------------------------------------------- #
+
+
+class _FixedClock:
+    """不推进的时钟:用于验证 clamp 后同一时刻不忙循环。"""
+
+    def __init__(self, t: object | None = None) -> None:
+        from datetime import UTC, datetime
+
+        self._t = t or datetime(2026, 1, 1, tzinfo=UTC)
+
+    def now(self) -> object:
+        return self._t
+
+
+def test_activity_routes_only_to_matching_provider_version() -> None:
+    provider = FakeProvider()
+    h = _OpHarness(provider)  # registry 只含 ("fake", "1")
+    op1 = h.initiate(_make_spec("att-1", "shot_01", provider_version="1"))
+    op2 = h.initiate(_make_spec("att-2", "shot_02", provider_version="2"))
+
+    for _ in range(30):
+        if not h.activity.tick():
+            break
+        h.drain_worker()
+
+    # 匹配 v1:正常推进并恰好一次计费
+    assert h.op_status(op1) is not ProviderOpStatus.INITIATED
+    assert provider.charge_count(op1) == 1
+    # 不匹配 v2:parked 于 INITIATED,零计费(绝不交给错误适配器)
+    assert h.op_status(op2) is ProviderOpStatus.INITIATED
+    assert provider.charge_count(op2) == 0
+
+
+# --------------------------------------------------------------------------- #
+# 9. Blocker 2:strong-lookup-only,NotFound 后即可首次 submit(非幂等替身)
+# --------------------------------------------------------------------------- #
+
+
+def test_strong_lookup_only_submits_after_not_found() -> None:
+    # 严格非幂等 + 仅强 lookup:盲目重提会双扣费,靠 lookup NotFound 才安全首提。
+    provider = FakeProvider(
+        capabilities=ProviderCapabilities(
+            idempotent_submit=False, strong_lookup_by_key=True, webhook=False
+        ),
+        strict_non_idempotent=True,
+    )
+    h = _OpHarness(provider)
+    op = h.initiate(_make_spec("att-1", "shot_01"))
+
+    assert h.activity.tick() is True  # claim
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.CLAIMED
+
+    # 强一致 NotFound -> 首次 submit(修复前会永久 park)
+    assert h.activity.tick() is True
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.SUBMITTED
+    assert provider.charge_count(op) == 1
+
+    # 重启后 op 已 SUBMITTED:继续 poll -> 成功,仍恰好一次计费(未盲目重提)
+    fresh = h.new_worker()
+    assert fresh.tick() is True
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.SUCCEEDED
+    assert provider.charge_count(op) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 10. Blocker 3:activity/webhook 命令继承 root correlation,不用 operation_id 截断
+# --------------------------------------------------------------------------- #
+
+
+def test_activity_preserves_root_correlation() -> None:
+    stack = build_activity_stack()
+    stack.bus.publish(init_budget_command(_PROJECT))
+    stack.bus.publish(init_pipeline_command(_PROJECT))
+    stack.driver.run_until_quiescent()
+
+    from studio.production.provider_op import (
+        ProviderOperationInitiatedEvt,
+        ProviderOperationSubmittedEvt,
+        ProviderOperationSucceededEvt,
+    )
+
+    events = stack.db.state.events
+    initiated = [e for e in events if isinstance(e.payload, ProviderOperationInitiatedEvt)]
+    assert len(initiated) == 2
+    for init_evt in initiated:
+        op = init_evt.payload.operation_id  # type: ignore[attr-defined]
+        root = init_evt.correlation_id
+        assert root != op  # root 不是 operation_id
+        # 后续 activity 驱动的终态事件必须继承 root correlation
+        chain = [
+            e
+            for e in events
+            if e.stream_id == identity.provider_op_stream(op)
+            and isinstance(
+                e.payload, ProviderOperationSubmittedEvt | ProviderOperationSucceededEvt
+            )
+        ]
+        assert len(chain) >= 2
+        for e in chain:
+            assert e.correlation_id == root  # 不被 activity 截断为 operation_id
+
+
+# --------------------------------------------------------------------------- #
+# 11. Blocker 4:webhook 终态先于 RecordSubmitted 到达,不被永久拒绝
+# --------------------------------------------------------------------------- #
+
+
+def test_webhook_succeeded_before_submitted_is_not_rejected() -> None:
+    provider = FakeProvider()
+    h = _OpHarness(provider)
+    spec = _make_spec("att-1", "shot_01")
+    op = h.initiate(spec)
+    assert h.activity.tick() is True  # claim
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.CLAIMED
+
+    # 崩溃窗口:submit 已接单(charge=1),RecordSubmitted 未落库
+    provider.force_submit(op, _request(spec))
+    assert provider.charge_count(op) == 1
+
+    # webhook 成功终态先到:CLAIMED -> SUCCEEDED(不 bad_transition)
+    ingress = ProviderWebhookIngress(
+        bus=h.bus, uow_factory=h.factory, clock=h.clock  # type: ignore[arg-type]
+    )
+    ingress.deliver_succeeded(
+        operation_id=op, result_ref=provider.result_ref_for(op),
+        cost_actual=spec.estimated_cost, cost_currency=spec.currency,
+        provider_event_id=f"hook-{op}",
+    )
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.SUCCEEDED
+    assert provider.charge_count(op) == 1
+
+
+def test_webhook_failed_before_submitted_is_not_rejected() -> None:
+    provider = FakeProvider()
+    h = _OpHarness(provider)
+    spec = _make_spec("att-1", "shot_01")
+    op = h.initiate(spec)
+    assert h.activity.tick() is True  # claim
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.CLAIMED
+
+    provider.force_submit(op, _request(spec))
+
+    ingress = ProviderWebhookIngress(
+        bus=h.bus, uow_factory=h.factory, clock=h.clock  # type: ignore[arg-type]
+    )
+    ingress.deliver_failed(
+        operation_id=op, charged=True, cost_actual=spec.estimated_cost,
+        cost_currency=spec.currency, provider_event_id=f"hookfail-{op}",
+    )
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.FAILED
+
+
+# --------------------------------------------------------------------------- #
+# 12. Pending(0) 被 clamp,同一时刻不忙循环
+# --------------------------------------------------------------------------- #
+
+
+def test_zero_retry_after_does_not_spin() -> None:
+    provider = FakeProvider(pending_always=True, retry_after=timedelta(0))
+    clock = _FixedClock()  # 不推进:同一逻辑时刻反复 tick
+    h = _OpHarness(provider, clock=clock)
+    op = h.initiate(_make_spec("att-1", "shot_01"))
+
+    assert h.activity.tick() is True  # claim
+    h.drain_worker()
+    assert h.activity.tick() is True  # submit -> SUBMITTED
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.SUBMITTED
+
+    assert h.activity.tick() is True  # 首次 poll -> Pending(0) 被 clamp
+    h.drain_worker()
+    # 同一时刻再 tick:next_due 已 clamp 到 >now -> 不再 poll(无忙循环)
+    assert h.activity.tick() is False
+    assert provider.poll_count_for(op) == 1

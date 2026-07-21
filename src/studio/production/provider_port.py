@@ -1,19 +1,24 @@
 """Provider 端口:ActivityWorker 与真实/伪造 provider 之间的能力感知契约。
 
-能力(ProviderCapabilities)决定 CLAIMED 的默认恢复动作:
-- strong_lookup_by_key:先 lookup(operation_id),命中恢复,未命中再 submit;
-- 仅 idempotent_submit:直接以同 key 重复 submit,靠幂等收敛;
-- 两者皆无:禁止自动执行,parked 等待人工对账。
+能力(ProviderCapabilities)决定 CLAIMED 的默认恢复动作(单 owner 前提下):
+- strong_lookup_by_key:先 lookup(operation_id);命中恢复,**强一致 NotFound 即可安全首次 submit**
+  (强一致 NotFound 已证明未接单,无需 idempotent_submit);
+- 仅 idempotent_submit:无强 lookup,直接以同 key 重复 submit,靠幂等收敛灰色窗口;
+- 两者皆无:禁止自动执行,parked 等待人工对账(HA 多 worker 另需 lease)。
 
 结构化结果 + 两类异常,把"确定未发出"与"可能已接单"严格区分:
 - RetryableBeforeSendError:确定未发出 -> 保持 CLAIMED,稍后重试;
 - AmbiguousSubmissionError:可能已接单 -> SUBMISSION_UNKNOWN(parked,靠 lookup 恢复)。
 lookup 必须是按 operation_id 的**强一致**查询;仅能按 job_id 查询不算恢复能力
 (灰色窗口里还没有 job_id)。本 Step 不建模"provider 明确拒绝且无 job"的终态。
+
+ProviderRegistry 按 (provider_id, provider_version) 路由:单 Worker 依 spec 精确解析
+provider,无匹配则 park,绝不 claim 后交给错误适配器(跨 provider 幂等键无效)。
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -115,3 +120,17 @@ class ProviderPort(Protocol):
     def lookup(self, idempotency_key: str) -> LookupResult: ...
 
     def poll(self, job_id: str) -> PollResult: ...
+
+
+class ProviderRegistry:
+    """按 (provider_id, provider_version) 路由到具体 ProviderPort。
+
+    单 Worker 依 spec 精确解析;无匹配 -> resolve 返回 None(调用方 park,不 claim)。
+    这道 owner/routing barrier 防止跨 provider 重复真实提交(单 provider 幂等键救不了)。
+    """
+
+    def __init__(self, providers: Mapping[tuple[str, str], ProviderPort]) -> None:
+        self._providers = dict(providers)
+
+    def resolve(self, provider_id: str, provider_version: str) -> ProviderPort | None:
+        return self._providers.get((provider_id, provider_version))
