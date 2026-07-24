@@ -111,19 +111,42 @@ class StitchPayload(FrozenModel):
 
 
 class QCFinding(FrozenModel):
-    target_refs: tuple[ArtifactRef, ...]
-    target_partition: str | None
+    """单条质检问题项:规则编号 + 严重程度 + 问题描述 + 建议动作 + 目标分区。"""
+
+    rule_id: str
     severity: Severity
-    note: str
+    description: str
+    suggested_action: str
+    target_partition: str | None
 
 
 class QCReportPayload(FrozenModel):
+    """质量报告:不可变产物。评价器只"观察并出报告",流程决策由闸门策略另行产生。
+
+    不变式:
+    - 通过(passed=True)时不得携带返工范围;
+    - 不通过时必须至少给出一条问题项(须说明原因)。
+    报告编号/生成时间由所属 ArtifactVersion 的 artifact_id/created_at 承载,不在 payload 重复。
+    """
+
     kind: Literal[ArtifactType.QC_REPORT] = ArtifactType.QC_REPORT
     subject_refs: tuple[ArtifactRef, ...]
+    target_partition: str | None
     evaluator: str
     evaluator_version: str
-    criteria: tuple[str, ...]
+    criteria_version: str
+    passed: bool
     findings: tuple[QCFinding, ...]
+    rework_scope: tuple[str, ...]
+    feedback: str
+
+    @model_validator(mode="after")
+    def _check_conclusion(self) -> QCReportPayload:
+        if self.passed and self.rework_scope:
+            raise ValueError("通过的质量报告不得携带返工范围")
+        if not self.passed and not self.findings:
+            raise ValueError("不通过的质量报告必须至少给出一条问题项")
+        return self
 
 
 class DeliveryPayload(FrozenModel):
