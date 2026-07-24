@@ -67,12 +67,47 @@ class MarkArtifactStaleCmd(MessagePayload):
     partition_key: str | None
 
 
+class AcceptArtifactVersionCmd(MessagePayload):
+    """门控接受:由闸门决策发起,把某已提议候选正式接受(GATED 路径)。"""
+
+    type: Literal["accept_artifact_version"] = "accept_artifact_version"
+    project_id: str
+    series_id: str
+    candidate_id: str
+    decision_ref: str  # 触发本次接受的闸门决策/报告引用(审计)
+
+
+class RejectArtifactVersionCmd(MessagePayload):
+    """拒绝:候选尚未接受,质检直接不通过(已提议 -> 已拒绝)。"""
+
+    type: Literal["reject_artifact_version"] = "reject_artifact_version"
+    project_id: str
+    series_id: str
+    candidate_id: str
+    report_ref: str
+    reason: str
+
+
+class RevokeArtifactAcceptanceCmd(MessagePayload):
+    """撤销:曾被接受的版本经阶段质检发现问题而撤销接受(已接受 -> 接受已撤销)。"""
+
+    type: Literal["revoke_artifact_acceptance"] = "revoke_artifact_acceptance"
+    project_id: str
+    series_id: str
+    artifact_ref: ArtifactRef
+    report_ref: str
+    reason: str
+
+
 ProductionCommand = (
     InitializePipelineCmd
     | ExpandStageCmd
     | CreateTaskAttemptCmd
     | ProposeArtifactVersionCmd
     | MarkArtifactStaleCmd
+    | AcceptArtifactVersionCmd
+    | RejectArtifactVersionCmd
+    | RevokeArtifactAcceptanceCmd
 )
 
 
@@ -161,6 +196,29 @@ class ArtifactMarkedStaleEvt(MessagePayload):
     partition_key: str | None
 
 
+class ArtifactVersionRejectedEvt(MessagePayload):
+    type: Literal["artifact_version_rejected"] = "artifact_version_rejected"
+    project_id: str
+    series_id: str
+    revision: PositiveInt
+    artifact_ref: ArtifactRef
+    candidate_id: str
+    report_ref: str
+    reason: str
+
+
+class ArtifactAcceptanceRevokedEvt(MessagePayload):
+    type: Literal["artifact_acceptance_revoked"] = "artifact_acceptance_revoked"
+    project_id: str
+    series_id: str
+    revision: PositiveInt
+    artifact_ref: ArtifactRef
+    report_ref: str
+    reason: str
+    # 撤销后回退到的当前版本(同 series 剩余最高已接受未撤销版本;可能为空)
+    new_current_ref: ArtifactRef | None
+
+
 ProductionEvent = (
     PipelineInitializedEvt
     | StageExpandedEvt
@@ -170,4 +228,6 @@ ProductionEvent = (
     | ArtifactVersionProposedEvt
     | ArtifactVersionAcceptedEvt
     | ArtifactMarkedStaleEvt
+    | ArtifactVersionRejectedEvt
+    | ArtifactAcceptanceRevokedEvt
 )

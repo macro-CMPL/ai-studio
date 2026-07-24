@@ -23,11 +23,14 @@ from .budget import (
     SettleBudgetCmd,
 )
 from .payloads import (
+    AcceptArtifactVersionCmd,
     CreateTaskAttemptCmd,
     ExpandStageCmd,
     InitializePipelineCmd,
     MarkArtifactStaleCmd,
     ProposeArtifactVersionCmd,
+    RejectArtifactVersionCmd,
+    RevokeArtifactAcceptanceCmd,
 )
 from .provider_op import (
     AbortBeforeSubmissionCmd,
@@ -47,10 +50,17 @@ from .reconcile import EmitReconciliationTickCmd
 def canonical_target(command: Any) -> str:
     if isinstance(command, InitializePipelineCmd | ExpandStageCmd):
         return identity.project_stream(command.project_id)
-    if isinstance(command, ProposeArtifactVersionCmd):
+    if isinstance(
+        command,
+        ProposeArtifactVersionCmd
+        | AcceptArtifactVersionCmd
+        | RejectArtifactVersionCmd,
+    ):
         return identity.series_stream(command.series_id)
     if isinstance(command, MarkArtifactStaleCmd):
         return identity.series_stream(command.target_ref.series_id)
+    if isinstance(command, RevokeArtifactAcceptanceCmd):
+        return identity.series_stream(command.artifact_ref.series_id)
     if isinstance(
         command,
         InitializeBudgetCmd

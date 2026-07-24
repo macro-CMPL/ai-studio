@@ -59,11 +59,18 @@ class ArtifactType(StrEnum):
 
 
 class AcceptanceStatus(StrEnum):
-    """验收状态。允许 ACCEPTED 被后续 QC 撤销。"""
+    """验收状态。
+
+    - PROPOSED:候选版本已提议,尚未接受。
+    - ACCEPTED:通过接受(自动或门控),成为可被下游消费的版本。
+    - REJECTED:候选版本从未被接受,质检直接不通过(已提议 -> 已拒绝)。
+    - REVOKED:曾被接受,后续阶段质检发现问题而撤销接受(已接受 -> 接受已撤销)。
+    """
 
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+    REVOKED = "revoked"
 
 
 class CurrencyStatus(StrEnum):

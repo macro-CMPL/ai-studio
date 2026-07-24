@@ -1,8 +1,12 @@
-"""ArtifactSeriesDecider(artifact-series 流):分配 revision、接受、记录 stale 事实。
+"""ArtifactSeriesDecider(artifact-series 流):分配 revision、接受/拒绝/撤销、记录 stale 事实。
 
 - revision 由本 decider 依据 series 状态单调分配(杜绝并发 attempt 各自认领同一 revision)。
 - candidate 指纹去重:同一 candidate_id 异内容 => IdempotencyConflict;同内容 => 幂等空操作。
 - 校验 digest(payload) 与命令 digest 一致。
+- 生命周期:已提议 -> 已接受 / 已拒绝;已接受 -> 接受已撤销。历史版本永不删除。
+  - AUTO 模式:提议即接受(M3 行为)。
+  - GATED 模式:仅提议;由闸门决策显式接受(AcceptArtifactVersion)或拒绝(RejectArtifactVersion)。
+  - 撤销(RevokeArtifactAcceptance):曾接受的版本被阶段质检推翻,回退当前版本至剩余最高已接受版本。
 - stale 采用"原因级"幂等:(target, invalidated, replacement) 相同才视为重复。
 """
 
@@ -18,22 +22,36 @@ from studio.kernel.errors import IdempotencyConflict
 from studio.serialization import digest as compute_digest
 
 from .payloads import (
+    AcceptArtifactVersionCmd,
+    ArtifactAcceptanceRevokedEvt,
     ArtifactMarkedStaleEvt,
     ArtifactVersionAcceptedEvt,
     ArtifactVersionProposedEvt,
+    ArtifactVersionRejectedEvt,
     MarkArtifactStaleCmd,
     ProductionCommand,
     ProductionEvent,
     ProposeArtifactVersionCmd,
+    RejectArtifactVersionCmd,
+    RevokeArtifactAcceptanceCmd,
 )
 
+# 提案生命周期状态(字符串常量,便于 frozen 模型持有)。
+_PROPOSED = "proposed"
+_ACCEPTED = "accepted"
+_REJECTED = "rejected"
+_REVOKED = "revoked"
 
-class CandidateRecord(BaseModel):
+
+class ProposalRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
     candidate_id: str
-    digest: str
+    revision: int
+    artifact_ref: ArtifactRef
     produced_by_attempt: str
     output_key: str
+    partition_key: str | None
+    status: str
 
 
 class SeriesState(BaseModel):
@@ -41,14 +59,33 @@ class SeriesState(BaseModel):
 
     max_revision: int = 0
     current_ref: ArtifactRef | None = None
-    candidates: tuple[CandidateRecord, ...] = ()
-    accepted_refs: tuple[ArtifactRef, ...] = ()
+    proposals: tuple[ProposalRecord, ...] = ()
+    accepted_refs: tuple[ArtifactRef, ...] = ()  # 曾接受集合(stale 目标校验用)
     stale_reasons: tuple[tuple[str, str, str], ...] = ()
 
-    def candidate(self, candidate_id: str) -> CandidateRecord | None:
+    def by_candidate(self, candidate_id: str) -> ProposalRecord | None:
         return next(
-            (c for c in self.candidates if c.candidate_id == candidate_id), None
+            (p for p in self.proposals if p.candidate_id == candidate_id), None
         )
+
+    def by_ref(self, artifact_ref: ArtifactRef) -> ProposalRecord | None:
+        return next(
+            (p for p in self.proposals if p.artifact_ref == artifact_ref), None
+        )
+
+
+def _recompute_current(
+    proposals: tuple[ProposalRecord, ...], *, exclude_ref: ArtifactRef | None = None
+) -> ArtifactRef | None:
+    """当前版本 = 剩余 status==accepted 中最高 revision 的 ref(排除正被撤销者)。"""
+    live = [
+        p
+        for p in proposals
+        if p.status == _ACCEPTED and (exclude_ref is None or p.artifact_ref != exclude_ref)
+    ]
+    if not live:
+        return None
+    return max(live, key=lambda p: p.revision).artifact_ref
 
 
 class ArtifactSeriesDecider:
@@ -60,6 +97,12 @@ class ArtifactSeriesDecider:
     ) -> Accepted[ProductionEvent] | Rejected:
         if isinstance(command, ProposeArtifactVersionCmd):
             return self._propose(state, command)
+        if isinstance(command, AcceptArtifactVersionCmd):
+            return self._accept(state, command)
+        if isinstance(command, RejectArtifactVersionCmd):
+            return self._reject(state, command)
+        if isinstance(command, RevokeArtifactAcceptanceCmd):
+            return self._revoke(state, command)
         if isinstance(command, MarkArtifactStaleCmd):
             return self._mark_stale(state, command)
         return Rejected("unexpected_command", f"series 流不处理 {command.type}")
@@ -75,10 +118,10 @@ class ArtifactSeriesDecider:
         if compute_digest(command.payload) != command.digest:
             return Rejected("digest_mismatch", "digest 与 payload 不一致")
 
-        prior = state.candidate(command.candidate_id)
+        prior = state.by_candidate(command.candidate_id)
         if prior is not None:
             same = (
-                prior.digest == command.digest
+                prior.artifact_ref.digest == command.digest
                 and prior.produced_by_attempt == command.produced_by_attempt
                 and prior.output_key == command.output_key
             )
@@ -129,6 +172,94 @@ class ArtifactSeriesDecider:
             )
         return Accepted(tuple(events))
 
+    def _accept(
+        self, state: SeriesState, command: AcceptArtifactVersionCmd
+    ) -> Accepted[ProductionEvent] | Rejected:
+        proposal = state.by_candidate(command.candidate_id)
+        if proposal is None:
+            return Rejected("unknown_candidate", "候选未在本 series 提议")
+        if proposal.status == _ACCEPTED:
+            return Accepted(())  # 幂等
+        if proposal.status in (_REJECTED, _REVOKED):
+            raise IdempotencyConflict(
+                command.candidate_id, f"已 {proposal.status} 的版本不可再接受"
+            )
+        return Accepted(
+            (
+                ProposedEvent(
+                    f"accepted:r{proposal.revision}",
+                    ArtifactVersionAcceptedEvt(
+                        project_id=command.project_id,
+                        series_id=command.series_id,
+                        revision=proposal.revision,
+                        artifact_ref=proposal.artifact_ref,
+                        previous_current_ref=state.current_ref,
+                        candidate_id=proposal.candidate_id,
+                        produced_by_attempt=proposal.produced_by_attempt,
+                        output_key=proposal.output_key,
+                        partition_key=proposal.partition_key,
+                    ),
+                ),
+            )
+        )
+
+    def _reject(
+        self, state: SeriesState, command: RejectArtifactVersionCmd
+    ) -> Accepted[ProductionEvent] | Rejected:
+        proposal = state.by_candidate(command.candidate_id)
+        if proposal is None:
+            return Rejected("unknown_candidate", "候选未在本 series 提议")
+        if proposal.status == _REJECTED:
+            return Accepted(())  # 幂等
+        if proposal.status in (_ACCEPTED, _REVOKED):
+            raise IdempotencyConflict(
+                command.candidate_id, "已接受的版本应走撤销而非拒绝"
+            )
+        return Accepted(
+            (
+                ProposedEvent(
+                    f"rejected:r{proposal.revision}",
+                    ArtifactVersionRejectedEvt(
+                        project_id=command.project_id,
+                        series_id=command.series_id,
+                        revision=proposal.revision,
+                        artifact_ref=proposal.artifact_ref,
+                        candidate_id=proposal.candidate_id,
+                        report_ref=command.report_ref,
+                        reason=command.reason,
+                    ),
+                ),
+            )
+        )
+
+    def _revoke(
+        self, state: SeriesState, command: RevokeArtifactAcceptanceCmd
+    ) -> Accepted[ProductionEvent] | Rejected:
+        proposal = state.by_ref(command.artifact_ref)
+        if proposal is None:
+            return Rejected("unknown_target", "目标 ArtifactRef 未在本 series 提议")
+        if proposal.status == _REVOKED:
+            return Accepted(())  # 幂等
+        if proposal.status != _ACCEPTED:
+            return Rejected("not_accepted", "仅已接受的版本可被撤销")
+        new_current = _recompute_current(state.proposals, exclude_ref=command.artifact_ref)
+        return Accepted(
+            (
+                ProposedEvent(
+                    f"revoked:r{proposal.revision}",
+                    ArtifactAcceptanceRevokedEvt(
+                        project_id=command.project_id,
+                        series_id=command.series_id,
+                        revision=proposal.revision,
+                        artifact_ref=command.artifact_ref,
+                        report_ref=command.report_ref,
+                        reason=command.reason,
+                        new_current_ref=new_current,
+                    ),
+                ),
+            )
+        )
+
     def _mark_stale(
         self, state: SeriesState, command: MarkArtifactStaleCmd
     ) -> Accepted[ProductionEvent] | Rejected:
@@ -160,23 +291,44 @@ class ArtifactSeriesDecider:
 
     def evolve(self, state: SeriesState, event: ProductionEvent) -> SeriesState:
         if isinstance(event, ArtifactVersionProposedEvt):
-            record = CandidateRecord(
+            record = ProposalRecord(
                 candidate_id=event.candidate_id,
-                digest=event.artifact_ref.digest,
+                revision=event.revision,
+                artifact_ref=event.artifact_ref,
                 produced_by_attempt=event.produced_by_attempt,
                 output_key=event.output_key,
+                partition_key=event.partition_key,
+                status=_PROPOSED,
             )
             return state.model_copy(
                 update={
-                    "max_revision": event.revision,
-                    "candidates": (*state.candidates, record),
+                    "max_revision": max(state.max_revision, event.revision),
+                    "proposals": (*state.proposals, record),
                 }
             )
         if isinstance(event, ArtifactVersionAcceptedEvt):
+            proposals = _set_status(state.proposals, event.artifact_ref, _ACCEPTED)
             return state.model_copy(
                 update={
-                    "current_ref": event.artifact_ref,
+                    "proposals": proposals,
+                    "current_ref": _recompute_current(proposals),
                     "accepted_refs": (*state.accepted_refs, event.artifact_ref),
+                }
+            )
+        if isinstance(event, ArtifactVersionRejectedEvt):
+            return state.model_copy(
+                update={
+                    "proposals": _set_status(
+                        state.proposals, event.artifact_ref, _REJECTED
+                    )
+                }
+            )
+        if isinstance(event, ArtifactAcceptanceRevokedEvt):
+            proposals = _set_status(state.proposals, event.artifact_ref, _REVOKED)
+            return state.model_copy(
+                update={
+                    "proposals": proposals,
+                    "current_ref": event.new_current_ref,
                 }
             )
         if isinstance(event, ArtifactMarkedStaleEvt):
@@ -189,3 +341,12 @@ class ArtifactSeriesDecider:
                 update={"stale_reasons": (*state.stale_reasons, reason)}
             )
         return state
+
+
+def _set_status(
+    proposals: tuple[ProposalRecord, ...], ref: ArtifactRef, status: str
+) -> tuple[ProposalRecord, ...]:
+    return tuple(
+        p.model_copy(update={"status": status}) if p.artifact_ref == ref else p
+        for p in proposals
+    )
