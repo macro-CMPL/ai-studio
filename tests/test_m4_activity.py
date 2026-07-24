@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
+import pytest
+
 from fake_provider import FakeProvider
 from kernel_helpers import FakeClock
 from m4_helpers import (
@@ -35,6 +37,8 @@ from studio.infrastructure.memory.unit_of_work import (
     MemoryCommandBus,
     MemoryUnitOfWorkFactory,
 )
+from studio.kernel.decisions import Accepted
+from studio.kernel.errors import IdempotencyConflict
 from studio.production import identity
 from studio.production.activity_worker import ProviderActivityWorker, activity_command_id
 from studio.production.budget import BudgetReleasedEvt, BudgetSettlementCompletedEvt
@@ -46,6 +50,7 @@ from studio.production.provider_op import (
     InitiateProviderOpCmd,
     ProviderOperationAbortedEvt,
     ProviderOperationDecider,
+    ProviderOperationJobLinkedEvt,
     ProviderOperationSubmissionUnknownEvt,
     ProviderResultRef,
     RecordSubmittedCmd,
@@ -578,43 +583,140 @@ def test_zero_retry_after_does_not_spin() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 13. 迟到 RecordSubmitted 被终态安全吸收(webhook 抢先 CLAIMED->终态后)
+# 13. 迟到 Submitted 的 job identity 一致性(不静默吞冲突 job_id)
 # --------------------------------------------------------------------------- #
 
 
-def test_late_submitted_after_terminal_is_absorbed() -> None:
-    from studio.kernel.decisions import Accepted
+def _apply(dec: ProviderOperationDecider, state: object, cmd: object) -> object:
+    """fold 一条命令的产出事件到 state(命令须被 Accepted)。"""
+    decision = dec.decide(state, cmd)  # type: ignore[arg-type]
+    assert isinstance(decision, Accepted)
+    for pe in decision.events:
+        state = dec.evolve(state, pe.payload)  # type: ignore[arg-type]
+    return state
 
+
+def _at_submitted(job_id: str) -> tuple[ProviderOperationDecider, object, str]:
+    """把 op 驱动到 SUBMITTED(job_id 已记录)-> SUCCEEDED。"""
     dec = ProviderOperationDecider()
     spec = _make_spec("att-1", "shot_01")
     op = spec.operation_id
-    state = dec.initial_state()
-    # initiate -> claim(op 进入 CLAIMED)
-    for cmd in (
-        InitiateProviderOpCmd(operation_id=op, spec=spec),
-        ClaimSubmissionCmd(operation_id=op),
-    ):
-        decision = dec.decide(state, cmd)
-        assert isinstance(decision, Accepted)
-        for pe in decision.events:
-            state = dec.evolve(state, pe.payload)
-    assert state.status is ProviderOpStatus.CLAIMED
-
-    # webhook 成功终态自 CLAIMED 直接收敛
-    succ = RecordSucceededCmd(
-        operation_id=op,
-        result_ref=ProviderResultRef(blob_ref="blob", digest="a" * 64),
-        cost_actual=spec.estimated_cost, cost_currency=spec.currency,
-        provider_event_id="hook-1",
+    state: object = dec.initial_state()
+    state = _apply(dec, state, InitiateProviderOpCmd(operation_id=op, spec=spec))
+    state = _apply(dec, state, ClaimSubmissionCmd(operation_id=op))
+    state = _apply(
+        dec, state,
+        RecordSubmittedCmd(operation_id=op, job_id=job_id, provider_event_id="sub-1"),
     )
-    decision = dec.decide(state, succ)
-    assert isinstance(decision, Accepted)
-    for pe in decision.events:
-        state = dec.evolve(state, pe.payload)
-    assert state.status is ProviderOpStatus.SUCCEEDED
+    state = _apply(
+        dec, state,
+        RecordSucceededCmd(
+            operation_id=op, result_ref=ProviderResultRef(blob_ref="b", digest="a" * 64),
+            cost_actual=spec.estimated_cost, cost_currency=spec.currency,
+            provider_event_id="ok-1",
+        ),
+    )
+    assert state.status is ProviderOpStatus.SUCCEEDED  # type: ignore[attr-defined]
+    return dec, state, op
 
-    # 迟到的 RecordSubmitted:被终态安全吸收(Accepted 空事件),不 bad_transition、不改状态
-    late = RecordSubmittedCmd(operation_id=op, job_id="job-1", provider_event_id="sub-1")
+
+def test_late_submitted_same_job_is_absorbed() -> None:
+    # 终态已记录 job=J1;迟到 Submitted(J1,不同 event_id)-> 幂等吸收,不改状态。
+    dec, state, op = _at_submitted("job-1")
+    late = RecordSubmittedCmd(operation_id=op, job_id="job-1", provider_event_id="late-evt")
     decision = dec.decide(state, late)
     assert isinstance(decision, Accepted)
     assert decision.events == ()
+
+
+def test_late_submitted_different_job_conflicts() -> None:
+    # 终态已记录 job=J1;迟到 Submitted(J2)-> IdempotencyConflict(不掩盖双 job 双付费)。
+    dec, state, op = _at_submitted("job-1")
+    conflicting = RecordSubmittedCmd(
+        operation_id=op, job_id="job-2", provider_event_id="late-evt"
+    )
+    with pytest.raises(IdempotencyConflict):
+        dec.decide(state, conflicting)
+
+
+def _webhook_first_success() -> tuple[ProviderOperationDecider, object, str]:
+    """CLAIMED -> webhook SUCCEEDED(此时 state.job_id is None)。"""
+    dec = ProviderOperationDecider()
+    spec = _make_spec("att-1", "shot_01")
+    op = spec.operation_id
+    state: object = dec.initial_state()
+    state = _apply(dec, state, InitiateProviderOpCmd(operation_id=op, spec=spec))
+    state = _apply(dec, state, ClaimSubmissionCmd(operation_id=op))
+    state = _apply(
+        dec, state,
+        RecordSucceededCmd(
+            operation_id=op, result_ref=ProviderResultRef(blob_ref="b", digest="a" * 64),
+            cost_actual=spec.estimated_cost, cost_currency=spec.currency,
+            provider_event_id="hook-1",
+        ),
+    )
+    assert state.status is ProviderOpStatus.SUCCEEDED  # type: ignore[attr-defined]
+    assert state.job_id is None  # type: ignore[attr-defined]
+    return dec, state, op
+
+
+def test_webhook_first_links_late_job_without_leaving_terminal() -> None:
+    # webhook 抢先自 CLAIMED 收敛(无 job);迟到 Submitted(J1)-> 落 JobLinked 事实,
+    # 记录 job_id 但不改终态。
+    dec, state, op = _webhook_first_success()
+    late = RecordSubmittedCmd(operation_id=op, job_id="job-1", provider_event_id="sub-1")
+    decision = dec.decide(state, late)
+    assert isinstance(decision, Accepted)
+    assert len(decision.events) == 1
+    assert isinstance(decision.events[0].payload, ProviderOperationJobLinkedEvt)
+    new_state = dec.evolve(state, decision.events[0].payload)
+    assert new_state.status is ProviderOpStatus.SUCCEEDED  # 终态未变
+    assert new_state.job_id == "job-1"  # job 已链接
+
+
+def test_webhook_first_second_different_job_conflicts() -> None:
+    # 链接 J1 后,迟到 Submitted(J2)-> IdempotencyConflict(链接后仍能识别冲突)。
+    dec, state, op = _webhook_first_success()
+    linked = _apply(
+        dec, state,
+        RecordSubmittedCmd(operation_id=op, job_id="job-1", provider_event_id="sub-1"),
+    )
+    assert linked.job_id == "job-1"  # type: ignore[attr-defined]
+    conflicting = RecordSubmittedCmd(
+        operation_id=op, job_id="job-2", provider_event_id="sub-2"
+    )
+    with pytest.raises(IdempotencyConflict):
+        dec.decide(linked, conflicting)
+
+
+# --------------------------------------------------------------------------- #
+# 18. A/B 路由:两个已注册 Provider,只有目标 Provider 被调用与扣费
+# --------------------------------------------------------------------------- #
+
+
+def test_two_registered_providers_only_target_is_charged() -> None:
+    provider_a = FakeProvider()
+    provider_b = FakeProvider()
+    registry = ProviderRegistry(
+        {("prov-a", "1"): provider_a, ("prov-b", "1"): provider_b}
+    )
+    h = _OpHarness(provider_a, registry=registry)
+    op_a = h.initiate(
+        _make_spec("att-a", "shot_01", provider_id="prov-a", provider_version="1")
+    )
+    op_b = h.initiate(
+        _make_spec("att-b", "shot_02", provider_id="prov-b", provider_version="1")
+    )
+
+    for _ in range(60):
+        if not h.activity.tick():
+            break
+        h.drain_worker()
+
+    # 各自被对应 Provider 处理、各扣一次;绝不交叉扣费(跨 Provider 幂等键无效)
+    assert h.op_status(op_a) is ProviderOpStatus.SUCCEEDED
+    assert h.op_status(op_b) is ProviderOpStatus.SUCCEEDED
+    assert provider_a.charge_count(op_a) == 1
+    assert provider_a.charge_count(op_b) == 0
+    assert provider_b.charge_count(op_b) == 1
+    assert provider_b.charge_count(op_a) == 0

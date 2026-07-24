@@ -177,6 +177,19 @@ class ProviderOperationAbortedEvt(MessagePayload):
     reason: str
 
 
+class ProviderOperationJobLinkedEvt(MessagePayload):
+    """终态(webhook 抢先自 CLAIMED 收敛)后,把迟到 Submitted 的 job 绑定到本 op。
+
+    不改变终态状态,只记录 job_id + provider_event_id,使后续:
+    同 job -> 幂等;异 job -> IdempotencyConflict(暴露一 operation 对应两 provider job)。
+    """
+
+    type: Literal["provider_op_job_linked"] = "provider_op_job_linked"
+    operation_id: str
+    job_id: str
+    provider_event_id: str
+
+
 ProviderOpEvent = (
     ProviderOperationInitiatedEvt
     | SubmissionAttemptClaimedEvt
@@ -185,6 +198,7 @@ ProviderOpEvent = (
     | ProviderOperationFailedEvt
     | ProviderOperationSubmissionUnknownEvt
     | ProviderOperationAbortedEvt
+    | ProviderOperationJobLinkedEvt
 )
 
 
@@ -323,14 +337,26 @@ class ProviderOperationDecider:
         fingerprint = digest({"kind": "submitted", "job_id": cmd.job_id})
         if self._dedup(state, event_id, fingerprint):
             return Accepted(())
-        if state.status is ProviderOpStatus.SUBMITTED:
+        # 一旦记录过 job_id(SUBMITTED,或终态经 JobLinked 记录),按 job_id 判定一致性:
+        # 同 job 幂等;异 job 冲突 —— 防同一 operation 关联两个 provider job(掩盖重复付费)。
+        if state.job_id is not None:
             if state.job_id == cmd.job_id:
                 return Accepted(())
-            raise IdempotencyConflict(cmd.operation_id, "SUBMITTED job_id 不一致")
-        # 迟到的 submitted:op 已被可信终态(webhook 抢先自 CLAIMED 收敛)推过 SUBMITTED,
-        # 安全吸收为幂等 no-op —— 不反向改状态,也不被永久 REJECTED。
+            raise IdempotencyConflict(cmd.operation_id, "job_id 与已记录不一致")
+        # 终态但尚无 job_id(webhook 抢先自 CLAIMED 收敛,未留 SUBMITTED 事件):
+        # 落一条 ProviderJobLinked 事实记录 job_id,不改终态;后续同 job 幂等、异 job 冲突。
         if state.status in (ProviderOpStatus.SUCCEEDED, ProviderOpStatus.FAILED):
-            return Accepted(())
+            return Accepted(
+                (
+                    ProposedEvent(
+                        "job-linked",
+                        ProviderOperationJobLinkedEvt(
+                            operation_id=cmd.operation_id, job_id=cmd.job_id,
+                            provider_event_id=event_id,
+                        ),
+                    ),
+                )
+            )
         allowed = (
             (ProviderOpStatus.CLAIMED,)
             if isinstance(cmd, RecordSubmittedCmd)
@@ -529,6 +555,23 @@ class ProviderOperationDecider:
                                     "cost": canon_money(event.cost_actual),
                                     "currency": event.cost_currency,
                                 }
+                            ),
+                        ),
+                    ),
+                }
+            )
+        if isinstance(event, ProviderOperationJobLinkedEvt):
+            # 只补记 job_id + 去重指纹,不改终态。用于 webhook 抢先自 CLAIMED 收敛后
+            # 迟到 Submitted 的 job 归属登记(后续同 job 幂等、异 job 冲突)。
+            return state.model_copy(
+                update={
+                    "job_id": event.job_id,
+                    "events": (
+                        *state.events,
+                        ProviderEventRecord(
+                            provider_event_id=event.provider_event_id,
+                            fingerprint=digest(
+                                {"kind": "submitted", "job_id": event.job_id}
                             ),
                         ),
                     ),
