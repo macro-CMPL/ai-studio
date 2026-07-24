@@ -26,6 +26,7 @@ from .gate import DecideGateCmd
 from .payloads import (
     AcceptArtifactVersionCmd,
     CreateTaskAttemptCmd,
+    EscalateAwaitHumanCmd,
     ExpandStageCmd,
     InitializePipelineCmd,
     MarkArtifactStaleCmd,
@@ -49,7 +50,9 @@ from .reconcile import EmitReconciliationTickCmd
 
 
 def canonical_target(command: Any) -> str:
-    if isinstance(command, InitializePipelineCmd | ExpandStageCmd):
+    if isinstance(
+        command, InitializePipelineCmd | ExpandStageCmd | EscalateAwaitHumanCmd
+    ):
         return identity.project_stream(command.project_id)
     if isinstance(
         command,

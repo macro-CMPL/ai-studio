@@ -104,6 +104,18 @@ class RevokeArtifactAcceptanceCmd(MessagePayload):
     reason: str
 
 
+class EscalateAwaitHumanCmd(MessagePayload):
+    """返工上限升级:某分区返工次数超过上限,项目进入等待人工决策(不再自动付费重做)。"""
+
+    type: Literal["escalate_await_human"] = "escalate_await_human"
+    project_id: str
+    stage_id: str
+    partition_key: str | None
+    report_ref: str
+    generation: int  # 若继续返工将达到的代数(已超过上限)
+    reason: str
+
+
 ProductionCommand = (
     InitializePipelineCmd
     | ExpandStageCmd
@@ -113,6 +125,7 @@ ProductionCommand = (
     | AcceptArtifactVersionCmd
     | RejectArtifactVersionCmd
     | RevokeArtifactAcceptanceCmd
+    | EscalateAwaitHumanCmd
 )
 
 
@@ -228,6 +241,18 @@ class ArtifactAcceptanceRevokedEvt(MessagePayload):
     new_current_ref: ArtifactRef | None
 
 
+class ProjectAwaitingHumanEvt(MessagePayload):
+    """项目等待人工决策:某分区返工超过上限而升级,记录为项目级显式事实。"""
+
+    type: Literal["project_awaiting_human"] = "project_awaiting_human"
+    project_id: str
+    stage_id: str
+    partition_key: str | None
+    report_ref: str
+    generation: int
+    reason: str
+
+
 ProductionEvent = (
     PipelineInitializedEvt
     | StageExpandedEvt
@@ -239,4 +264,5 @@ ProductionEvent = (
     | ArtifactMarkedStaleEvt
     | ArtifactVersionRejectedEvt
     | ArtifactAcceptanceRevokedEvt
+    | ProjectAwaitingHumanEvt
 )
