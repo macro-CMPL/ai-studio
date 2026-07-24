@@ -41,6 +41,11 @@ class CreateTaskAttemptCmd(MessagePayload):
     output_key: str
     series_id: str
     exact_refs: tuple[BindingItem, ...]
+    # 相同输入强制重做:代数递增(0 首次;1、2… 返工),使 attempt_id/operation_id 变化。
+    execution_generation: int = 0
+    rework_of_attempt: str | None = None  # 上一次任务编号(返工来源)
+    rework_report_ref: str | None = None  # 触发返工的质量报告引用
+    rework_reason: str | None = None
 
 
 class ProposeArtifactVersionCmd(MessagePayload):
@@ -139,6 +144,10 @@ class TaskAttemptCreatedEvt(MessagePayload):
     partition_key: str | None
     output_key: str
     series_id: str
+    execution_generation: int = 0
+    rework_of_attempt: str | None = None
+    rework_report_ref: str | None = None
+    rework_reason: str | None = None
 
 
 class TaskInputsBoundEvt(MessagePayload):

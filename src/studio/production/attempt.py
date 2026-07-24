@@ -64,6 +64,9 @@ class AttemptState(BaseModel):
     result_fingerprint: str | None = None
     last_status_revision: int = 0  # 最后处理的 status_revision(causal event global_position)
     last_status_fingerprint: str | None = None  # 同 revision 冲突检测
+    execution_generation: int = 0  # 返工代数:相同输入强制重做时 +1(新身份、允许再扣费)
+    rework_of_attempt: str | None = None  # 触发本次重做的上一 attempt
+    rework_report_ref: str | None = None  # 触发返工的质量报告引用
 
 
 class TaskAttemptDecider:
@@ -140,9 +143,11 @@ class TaskAttemptDecider:
             cmd.project_id, cmd.output_key, cmd.partition_key
         ):
             return Rejected("forged_series", "series_id 与派生不一致")
+        if cmd.execution_generation < 0:
+            return Rejected("bad_generation", "execution_generation 不得为负")
         tk = identity.task_key(cmd.project_id, cmd.stage_id, cmd.partition_key)
         if cmd.attempt_id != identity.attempt_id(
-            tk, identity.input_binding_digest(cmd.exact_refs), 0
+            tk, identity.input_binding_digest(cmd.exact_refs), cmd.execution_generation
         ):
             return Rejected("forged_attempt", "attempt_id 与派生不一致")
 
@@ -153,6 +158,10 @@ class TaskAttemptDecider:
                     attempt_id=cmd.attempt_id, project_id=cmd.project_id,
                     stage_id=cmd.stage_id, partition_key=cmd.partition_key,
                     output_key=cmd.output_key, series_id=cmd.series_id,
+                    execution_generation=cmd.execution_generation,
+                    rework_of_attempt=cmd.rework_of_attempt,
+                    rework_report_ref=cmd.rework_report_ref,
+                    rework_reason=cmd.rework_reason,
                 ),
             ),
             ProposedEvent(
@@ -340,6 +349,9 @@ class TaskAttemptDecider:
                     "output_key": event.output_key,
                     "series_id": event.series_id,
                     "partition_key": event.partition_key,
+                    "execution_generation": event.execution_generation,
+                    "rework_of_attempt": event.rework_of_attempt,
+                    "rework_report_ref": event.rework_report_ref,
                 }
             )
         if isinstance(event, TaskInputsBoundEvt):
