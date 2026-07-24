@@ -86,6 +86,10 @@ def reconciliation_stream(scope: str) -> str:
     return f"reconciliation:{scope}"
 
 
+def gate_stream(report_id: str) -> str:
+    return f"gate:{report_id}"
+
+
 def stream_kind(target: str) -> str:
     return target.split(":", 1)[0]
 

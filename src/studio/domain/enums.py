@@ -158,11 +158,16 @@ class CardinalityKind(StrEnum):
 
 
 class GateVerdict(StrEnum):
-    """GatePolicy 由 QCReport 推导出的确定性控制决策。"""
+    """GatePolicy 由 QCReport 推导出的确定性控制决策。
+
+    单份报告的确定性策略产出 PASS / REWORK / BLOCK;
+    AWAIT_HUMAN 由返工上限升级机制(返工管理器)产出,不来自单报告评估。
+    """
 
     PASS = "pass"
     REWORK = "rework"
     BLOCK = "block"
+    AWAIT_HUMAN = "await_human"
 
 
 class Severity(StrEnum):

@@ -22,6 +22,7 @@ from .budget import (
     ReserveBudgetCmd,
     SettleBudgetCmd,
 )
+from .gate import DecideGateCmd
 from .payloads import (
     AcceptArtifactVersionCmd,
     CreateTaskAttemptCmd,
@@ -97,4 +98,6 @@ def canonical_target(command: Any) -> str:
         return identity.attempt_stream(command.attempt_id)
     if isinstance(command, EmitReconciliationTickCmd):
         return identity.reconciliation_stream(command.scope)
+    if isinstance(command, DecideGateCmd):
+        return identity.gate_stream(command.report_ref.artifact_id)
     raise ContractViolation(f"未知命令类型:{type(command).__name__}")
