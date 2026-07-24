@@ -327,6 +327,10 @@ class ProviderOperationDecider:
             if state.job_id == cmd.job_id:
                 return Accepted(())
             raise IdempotencyConflict(cmd.operation_id, "SUBMITTED job_id 不一致")
+        # 迟到的 submitted:op 已被可信终态(webhook 抢先自 CLAIMED 收敛)推过 SUBMITTED,
+        # 安全吸收为幂等 no-op —— 不反向改状态,也不被永久 REJECTED。
+        if state.status in (ProviderOpStatus.SUCCEEDED, ProviderOpStatus.FAILED):
+            return Accepted(())
         allowed = (
             (ProviderOpStatus.CLAIMED,)
             if isinstance(cmd, RecordSubmittedCmd)

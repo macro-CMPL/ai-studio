@@ -1,10 +1,13 @@
 """Provider 端口:ActivityWorker 与真实/伪造 provider 之间的能力感知契约。
 
-能力(ProviderCapabilities)决定 CLAIMED 的默认恢复动作(单 owner 前提下):
-- strong_lookup_by_key:先 lookup(operation_id);命中恢复,**强一致 NotFound 即可安全首次 submit**
-  (强一致 NotFound 已证明未接单,无需 idempotent_submit);
-- 仅 idempotent_submit:无强 lookup,直接以同 key 重复 submit,靠幂等收敛灰色窗口;
-- 两者皆无:禁止自动执行,parked 等待人工对账(HA 多 worker 另需 lease)。
+能力(ProviderCapabilities)决定 CLAIMED 的默认恢复动作。核心不变式:**submit 仅当
+idempotent_submit=True 才允许**(无 Activity lease 时,时点 NotFound 不足以排除两 worker
+同时 NotFound 后双提交,故须幂等键兜底):
+- strong_lookup + idempotent:先 lookup;命中->恢复,NotFound->submit(幂等安全);
+- 仅 strong_lookup(不幂等):lookup 命中->恢复,NotFound->**park**(无 lease 不盲目提交);
+- 仅 idempotent(无 lookup):直接以同 key 提交,靠幂等收敛灰色窗口;
+- 两者皆无:禁止自动执行,parked 等待人工对账。
+未来若明确保证单 Activity owner(lease),lookup-only NotFound 也可安全首提。
 
 结构化结果 + 两类异常,把"确定未发出"与"可能已接单"严格区分:
 - RetryableBeforeSendError:确定未发出 -> 保持 CLAIMED,稍后重试;

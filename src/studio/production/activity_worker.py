@@ -6,17 +6,19 @@
 owner/routing barrier:单 Worker + ProviderRegistry[(provider_id, provider_version)];
 无匹配 provider -> park(不 claim),防止跨 provider 重复真实提交。
 
-状态表:
+状态表(submit 仅当 idempotent_submit 才允许;无 lease 不盲目提交):
   INITIATED            发布 Claim(不做 provider I/O;先确认有匹配 provider)
-  CLAIMED              capability-aware:强 lookup 命中恢复 / NotFound 即可首次 submit;
-                       仅幂等 submit 则直接重提;两者皆无 park。
-  SUBMISSION_UNKNOWN   lookup;NotFound 且可提交则同 key 重提
+  CLAIMED              lookup 命中->恢复(RecordSubmitted);
+                       NotFound 仅当 submit 幂等才首提,否则 park(无 lease 时时点 NotFound
+                       不足以排除两 worker 双提交);无 lookup+幂等->直接提交;两者皆无 park。
+  SUBMISSION_UNKNOWN   lookup 命中->ReconcileSubmitted;NotFound 且幂等->同 key 重提;否则 park
   SUBMITTED            到期后 poll(retry_after 被 clamp 到 >0,防 Pending(0) 忙循环)
   SUCCEEDED/FAILED/ABORTED  无动作
 
 幂等身份:activity_command_id = UUIDv5(worker_id, operation_id, action, evidence_id);
 不使用时钟/poll 次数/运行时计数器派生 command_id 或 provider_event_id。
-correlation:继承 Initiated Envelope 的 root correlation_id,provider_event_id 只作 evidence。
+correlation:继承 Initiated Envelope 的 root correlation_id;causation:触发本动作的最新事件 id;
+provider_event_id 只作外部 evidence(命令幂等身份)。
 公平:轮转 cursor;每 tick 最多一次外部 I/O;Pending/retryable 靠 next_due 退避。
 """
 
@@ -77,6 +79,7 @@ class _OpView:
     spec: ProviderExecutionSpec
     job_id: str | None
     initiated_event_id: str
+    last_event_id: str
     correlation_id: str
     first_gp: int
 
@@ -200,6 +203,8 @@ class ProviderActivityWorker:
                     spec=state.spec,
                     job_id=state.job_id,
                     initiated_event_id=initiated_event_id,
+                    # 触发本动作的最新事件(建立当前状态者)= 命令 causation。
+                    last_event_id=ordered[-1].event_id,  # type: ignore[attr-defined]
                     correlation_id=correlation_id,
                     first_gp=ordered[0].global_position,  # type: ignore[attr-defined]
                 )
@@ -221,8 +226,12 @@ class ProviderActivityWorker:
                 self._publish_submitted(v, found.job_id, found.provider_event_id)
                 self._bk.acted[v.operation_id] = _CLAIMED
                 return True
-            # 强一致 NotFound:已证明未接单,可安全首次 submit(无需 idempotent_submit)。
-            return self._do_submit(provider, v, now, source=_CLAIMED)
+            # NotFound 只是时点真相:无 lease 时两 worker 可能同时 NotFound 后双提交。
+            # 仅当 submit 幂等才可安全首提;否则 park(等待人工/lease)。
+            if caps.idempotent_submit:
+                return self._do_submit(provider, v, now, source=_CLAIMED)
+            self._bk.acted[v.operation_id] = _CLAIMED
+            return False
         if caps.idempotent_submit:
             return self._do_submit(provider, v, now, source=_CLAIMED)
         # 两者皆无:park 等待人工(HA 需 lease,不在 M4 范围)。
@@ -375,7 +384,7 @@ class ProviderActivityWorker:
             target=identity.provider_op_stream(v.operation_id),
             command_key=command_key,
             correlation_id=v.correlation_id,  # 继承 root correlation(不用 operation_id)
-            causation_id=v.initiated_event_id,
+            causation_id=v.last_event_id,  # 触发本动作的最新事件(不用 root/operation_id)
             issued_at=self._clock.now(),
             payload=payload,
         )

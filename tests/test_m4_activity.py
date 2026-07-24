@@ -42,10 +42,14 @@ from studio.production.dispatch import canonical_target
 from studio.production.execution_spec import ProviderExecutionSpec
 from studio.production.payloads import ArtifactVersionAcceptedEvt
 from studio.production.provider_op import (
+    ClaimSubmissionCmd,
     InitiateProviderOpCmd,
     ProviderOperationAbortedEvt,
     ProviderOperationDecider,
     ProviderOperationSubmissionUnknownEvt,
+    ProviderResultRef,
+    RecordSubmittedCmd,
+    RecordSucceededCmd,
 )
 from studio.production.provider_port import (
     ProviderCapabilities,
@@ -408,12 +412,13 @@ def test_activity_routes_only_to_matching_provider_version() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 9. Blocker 2:strong-lookup-only,NotFound 后即可首次 submit(非幂等替身)
+# 9. 契约锁定:无 lease 时 lookup-only + NotFound 必须 park(不盲目提交)
 # --------------------------------------------------------------------------- #
 
 
-def test_strong_lookup_only_submits_after_not_found() -> None:
-    # 严格非幂等 + 仅强 lookup:盲目重提会双扣费,靠 lookup NotFound 才安全首提。
+def test_strong_lookup_only_not_found_parks_without_lease() -> None:
+    # 仅强 lookup、submit 非幂等、无 lease:NotFound 是时点真相,两 worker 可能同时
+    # NotFound 后双提交,故必须 park(不提交),等待人工/lease。
     provider = FakeProvider(
         capabilities=ProviderCapabilities(
             idempotent_submit=False, strong_lookup_by_key=True, webhook=False
@@ -427,17 +432,32 @@ def test_strong_lookup_only_submits_after_not_found() -> None:
     h.drain_worker()
     assert h.op_status(op) is ProviderOpStatus.CLAIMED
 
-    # 强一致 NotFound -> 首次 submit(修复前会永久 park)
-    assert h.activity.tick() is True
+    # lookup NotFound + 非幂等 + 无 lease -> park:不 submit、零扣费、停在 CLAIMED
+    assert h.activity.tick() is False
+    h.drain_worker()
+    assert h.op_status(op) is ProviderOpStatus.CLAIMED
+    assert provider.charge_count(op) == 0
+
+    # 再 tick 也不再重复 lookup/submit(parked,仍零扣费)
+    assert h.activity.tick() is False
+    assert provider.charge_count(op) == 0
+
+
+def test_lookup_plus_idempotent_submits_after_not_found() -> None:
+    # 强 lookup + 幂等 submit:NotFound 后可安全首提(幂等兜底并发双提交)。
+    provider = FakeProvider(
+        capabilities=ProviderCapabilities(
+            idempotent_submit=True, strong_lookup_by_key=True, webhook=False
+        )
+    )
+    h = _OpHarness(provider)
+    op = h.initiate(_make_spec("att-1", "shot_01"))
+
+    assert h.activity.tick() is True  # claim
+    h.drain_worker()
+    assert h.activity.tick() is True  # lookup NotFound -> submit
     h.drain_worker()
     assert h.op_status(op) is ProviderOpStatus.SUBMITTED
-    assert provider.charge_count(op) == 1
-
-    # 重启后 op 已 SUBMITTED:继续 poll -> 成功,仍恰好一次计费(未盲目重提)
-    fresh = h.new_worker()
-    assert fresh.tick() is True
-    h.drain_worker()
-    assert h.op_status(op) is ProviderOpStatus.SUCCEEDED
     assert provider.charge_count(op) == 1
 
 
@@ -555,3 +575,46 @@ def test_zero_retry_after_does_not_spin() -> None:
     # 同一时刻再 tick:next_due 已 clamp 到 >now -> 不再 poll(无忙循环)
     assert h.activity.tick() is False
     assert provider.poll_count_for(op) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 13. 迟到 RecordSubmitted 被终态安全吸收(webhook 抢先 CLAIMED->终态后)
+# --------------------------------------------------------------------------- #
+
+
+def test_late_submitted_after_terminal_is_absorbed() -> None:
+    from studio.kernel.decisions import Accepted
+
+    dec = ProviderOperationDecider()
+    spec = _make_spec("att-1", "shot_01")
+    op = spec.operation_id
+    state = dec.initial_state()
+    # initiate -> claim(op 进入 CLAIMED)
+    for cmd in (
+        InitiateProviderOpCmd(operation_id=op, spec=spec),
+        ClaimSubmissionCmd(operation_id=op),
+    ):
+        decision = dec.decide(state, cmd)
+        assert isinstance(decision, Accepted)
+        for pe in decision.events:
+            state = dec.evolve(state, pe.payload)
+    assert state.status is ProviderOpStatus.CLAIMED
+
+    # webhook 成功终态自 CLAIMED 直接收敛
+    succ = RecordSucceededCmd(
+        operation_id=op,
+        result_ref=ProviderResultRef(blob_ref="blob", digest="a" * 64),
+        cost_actual=spec.estimated_cost, cost_currency=spec.currency,
+        provider_event_id="hook-1",
+    )
+    decision = dec.decide(state, succ)
+    assert isinstance(decision, Accepted)
+    for pe in decision.events:
+        state = dec.evolve(state, pe.payload)
+    assert state.status is ProviderOpStatus.SUCCEEDED
+
+    # 迟到的 RecordSubmitted:被终态安全吸收(Accepted 空事件),不 bad_transition、不改状态
+    late = RecordSubmittedCmd(operation_id=op, job_id="job-1", provider_event_id="sub-1")
+    decision = dec.decide(state, late)
+    assert isinstance(decision, Accepted)
+    assert decision.events == ()
