@@ -89,3 +89,41 @@ class QualityConfig:
 
     def rework_limit(self, stage_id: str) -> int | None:
         return self._rework_limits.get(stage_id)
+
+
+def golden_m5_quality_config(*, image_rework_limit: int = 2) -> QualityConfig:
+    """M5 黄金流程的质量层配置:提示词/结果/阶段三层 + plan/image 门控 + 单镜头返工上限。"""
+    layers = (
+        QCLayerSpec(
+            layer=QCLayer.PROMPT,
+            qc_stage_id="prompt_qc",
+            subject_output_key="plan",
+            subject_artifact_type=ArtifactType.IMAGE_PLAN,
+        ),
+        QCLayerSpec(
+            layer=QCLayer.RESULT,
+            qc_stage_id="result_qc",
+            subject_output_key="image",
+            subject_artifact_type=ArtifactType.IMAGE,
+        ),
+        QCLayerSpec(
+            layer=QCLayer.STAGE,
+            qc_stage_id="stage_qc",
+            subject_output_key="image",
+            subject_artifact_type=ArtifactType.IMAGE,
+        ),
+    )
+    policies = {
+        QCLayer.PROMPT: GatePolicy(
+            policy_id="prompt-gate", policy_version="1",
+            blocking_rule_ids=frozenset({"forbidden_content"}),
+        ),
+        QCLayer.RESULT: GatePolicy(policy_id="result-gate", policy_version="1"),
+        QCLayer.STAGE: GatePolicy(policy_id="stage-gate", policy_version="1"),
+    }
+    return QualityConfig(
+        layers=layers,
+        gated_output_keys=frozenset({"plan", "image"}),
+        policies=policies,
+        rework_limits={"image": image_rework_limit},
+    )

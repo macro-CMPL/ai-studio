@@ -51,13 +51,14 @@ def _storyboard_stage() -> StageSpec:
     )
 
 
-def _plan_stage() -> StageSpec:
+def _plan_stage(gated: bool = False) -> StageSpec:
     return StageSpec(
         stage_id="plan",
         executor_kind=ExecutorKind.AGENT,
         control_role=ControlRole.PRODUCER,
         allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
         cost_mode=CostMode.FREE,
+        gated=gated,
         requires=(
             Requirement(
                 artifact_type=ArtifactType.STORYBOARD,
@@ -84,7 +85,10 @@ def _plan_stage() -> StageSpec:
 
 
 def _image_stage(
-    executor_kind: ExecutorKind, cost_mode: CostMode, tool_effect: ToolEffectLevel
+    executor_kind: ExecutorKind,
+    cost_mode: CostMode,
+    tool_effect: ToolEffectLevel,
+    gated: bool = False,
 ) -> StageSpec:
     return StageSpec(
         stage_id="image",
@@ -92,6 +96,7 @@ def _image_stage(
         control_role=ControlRole.PRODUCER,
         allowed_tool_effects=frozenset({tool_effect}),
         cost_mode=cost_mode,
+        gated=gated,
         requires=(
             Requirement(
                 artifact_type=ArtifactType.IMAGE_PLAN,
@@ -127,6 +132,75 @@ def m3_stagespecs() -> tuple[StageSpec, ...]:
         _plan_stage(),
         _image_stage(ExecutorKind.TRANSFORM, CostMode.FREE, ToolEffectLevel.PURE),
     )
+
+
+# --------------------------------------------------------------------------- #
+# M5 完整视频流程:在 M4 基础上加三层质检(提示词/结果/阶段)与交付。
+# 质检与交付阶段由 M5 进程管理器显式调度(externally_scheduled),不参与自动展开;
+# plan / image 为门控产物(gated),提议后须经闸门决策接受。
+# --------------------------------------------------------------------------- #
+
+
+def _qc_stage(stage_id: str, partitioning: PartitioningKind) -> StageSpec:
+    """质检评价阶段:确定性 TRANSFORM 评价器,产出 QC_REPORT(外部调度)。"""
+    return StageSpec(
+        stage_id=stage_id,
+        executor_kind=ExecutorKind.TRANSFORM,
+        control_role=ControlRole.EVALUATOR,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        externally_scheduled=True,
+        requires=(),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.QC_REPORT,
+                logical_slot=stage_id,
+                schema_version=1,
+                partitioning=Partitioning(kind=partitioning),
+            ),
+        ),
+    )
+
+
+def _delivery_stage() -> StageSpec:
+    """交付阶段:确定性 TRANSFORM,聚合已接受图像产出交付包(外部调度)。"""
+    return StageSpec(
+        stage_id="delivery",
+        executor_kind=ExecutorKind.TRANSFORM,
+        control_role=ControlRole.PRODUCER,
+        allowed_tool_effects=frozenset({ToolEffectLevel.PURE}),
+        cost_mode=CostMode.FREE,
+        externally_scheduled=True,
+        requires=(),
+        produces=(
+            OutputSpec(
+                artifact_type=ArtifactType.DELIVERY,
+                logical_slot="delivery",
+                schema_version=1,
+                partitioning=Partitioning(kind=PartitioningKind.SINGLETON),
+            ),
+        ),
+    )
+
+
+def golden_m5_stagespecs() -> tuple[StageSpec, ...]:
+    """M5 完整流程:storyboard -> plan(gated) -> image(PROVIDER, gated)
+    + prompt_qc / result_qc / stage_qc + delivery(均外部调度)。"""
+    return (
+        _storyboard_stage(),
+        _plan_stage(gated=True),
+        _image_stage(
+            ExecutorKind.PROVIDER, CostMode.METERED, ToolEffectLevel.COSTED, gated=True
+        ),
+        _qc_stage("prompt_qc", PartitioningKind.INHERIT_PARTITION),
+        _qc_stage("result_qc", PartitioningKind.INHERIT_PARTITION),
+        _qc_stage("stage_qc", PartitioningKind.SINGLETON),
+        _delivery_stage(),
+    )
+
+
+def golden_m5_compiled() -> CompiledPipelineSpec:
+    return compile_from(golden_m5_stagespecs())
 
 
 def golden_compiled() -> CompiledPipelineSpec:

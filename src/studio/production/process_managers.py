@@ -73,7 +73,13 @@ class PublishState(BaseModel):
 
 
 class PublishProcessManager:
+    """候选 -> 提议。门控产物(gated_output_keys)以 GATED 提议,须经闸门决策接受;
+    其余(含质量报告)以 AUTO 提议即接受(M3/M4 默认全 AUTO)。"""
+
     pm_id = "publish-pm"
+
+    def __init__(self, gated_output_keys: frozenset[str] = frozenset()) -> None:
+        self._gated = gated_output_keys
 
     def initial_state(self) -> PublishState:
         return PublishState()
@@ -84,6 +90,11 @@ class PublishProcessManager:
         payload = event.payload
         if not isinstance(payload, ArtifactCandidateProducedEvt):
             return Reaction(state=state, commands=())
+        mode = (
+            AcceptanceMode.GATED
+            if payload.output_key in self._gated
+            else AcceptanceMode.AUTO
+        )
         cmd = ProposeArtifactVersionCmd(
             project_id=payload.project_id,
             series_id=payload.series_id,
@@ -92,7 +103,7 @@ class PublishProcessManager:
             partition_key=payload.partition_key,
             digest=payload.digest,
             payload=payload.payload,
-            acceptance_mode=AcceptanceMode.AUTO,
+            acceptance_mode=mode,
             produced_by_attempt=payload.attempt_id,
         )
         return Reaction(

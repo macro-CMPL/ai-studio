@@ -100,6 +100,11 @@ class StageSpec(FrozenModel):
     cost_mode: CostMode
     requires: tuple[Requirement, ...]
     produces: tuple[OutputSpec, ...]
+    # 由 M5 进程管理器显式调度(质检/交付),不参与基于已接受输入的自动展开。
+    # 其输入绑定由对应 PM 构造,故编译期跳过其依赖图接线与分区交叉校验。
+    externally_scheduled: bool = False
+    # 产物是否需门控接受(GATED):提议后须经闸门决策显式接受,而非自动接受。
+    gated: bool = False
 
     @field_serializer("allowed_tool_effects")
     def _ser_effects(self, effects: frozenset[ToolEffectLevel]) -> list[str]:

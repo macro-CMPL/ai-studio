@@ -29,7 +29,7 @@ from studio.domain.enums import (
     PropagationMode,
     ToolEffectLevel,
 )
-from studio.domain.stages import Requirement, StageSpec
+from studio.domain.stages import OutputSpec, Requirement, StageSpec
 from studio.serialization import digest
 
 COMPILER_VERSION = "1"
@@ -77,6 +77,8 @@ class CompiledStage(BaseModel):
     partition_source: CompiledRequirement | None
     driver_stage: str | None
     upstream_stage: str | None
+    externally_scheduled: bool = False
+    gated: bool = False
 
 
 class CompiledPipelineSpec(BaseModel):
@@ -100,7 +102,12 @@ class CompiledPipelineSpec(BaseModel):
         return next((s for s in self.stages if s.output_key == output_key), None)
 
     def root_stages(self) -> tuple[CompiledStage, ...]:
-        return tuple(s for s in self.stages if s.mode is StageMode.ROOT_SINGLETON)
+        # 外部调度阶段(质检/交付)不参与 bootstrap 自动创建。
+        return tuple(
+            s
+            for s in self.stages
+            if s.mode is StageMode.ROOT_SINGLETON and not s.externally_scheduled
+        )
 
     def fanout_driven_by(self, output_key: str) -> tuple[CompiledStage, ...]:
         producer = self.by_output(output_key)
@@ -109,15 +116,19 @@ class CompiledPipelineSpec(BaseModel):
         return tuple(
             s
             for s in self.stages
-            if s.mode is StageMode.FANOUT and s.driver_stage == producer.stage_id
+            if s.mode is StageMode.FANOUT
+            and s.driver_stage == producer.stage_id
+            and not s.externally_scheduled
         )
 
     def consumers_of(
         self, output_key: str
     ) -> tuple[tuple[CompiledStage, CompiledRequirement], ...]:
-        """所有以 output_key 为输入的 (stage, requirement)。"""
+        """所有以 output_key 为输入的 (stage, requirement)。外部调度阶段不自动装配。"""
         out: list[tuple[CompiledStage, CompiledRequirement]] = []
         for s in self.stages:
+            if s.externally_scheduled:
+                continue
             for r in s.requirements:
                 if r.logical_slot == output_key:
                     out.append((s, r))
@@ -182,6 +193,15 @@ def compile_from(
     compiled: list[CompiledStage] = []
     for s in stages:
         out = s.produces[0]
+
+        # 外部调度阶段(质检/交付):不接依赖图、不做分区交叉校验,输入绑定由 M5 PM 构造。
+        if s.externally_scheduled:
+            if s.requires:
+                raise CompilationError(
+                    f"{s.stage_id}: 外部调度阶段不得声明 requires(输入由进程管理器构造)"
+                )
+            compiled.append(_compile_externally_scheduled(s, out))
+            continue
 
         creqs: list[CompiledRequirement] = []
         for req in s.requires:
@@ -264,6 +284,8 @@ def compile_from(
                 partition_source=partition_source,
                 driver_stage=driver_stage,
                 upstream_stage=upstream_stage,
+                externally_scheduled=False,
+                gated=s.gated,
             )
         )
 
@@ -274,6 +296,37 @@ def compile_from(
     _assert_acyclic(edges)
     compiled.sort(key=lambda c: c.stage_id)
     return CompiledPipelineSpec(compiler_version=compiler_version, stages=tuple(compiled))
+
+
+def _compile_externally_scheduled(s: StageSpec, out: OutputSpec) -> CompiledStage:
+    """外部调度阶段的编译:保留输出契约与执行器元数据,mode 按输出分区诚实标注。"""
+    kind = out.partitioning.kind
+    if kind is PartitioningKind.SINGLETON:
+        mode = StageMode.ROOT_SINGLETON
+    elif kind is PartitioningKind.DYNAMIC_FROM:
+        mode = StageMode.FANOUT
+    else:
+        mode = StageMode.PER_PARTITION
+    return CompiledStage(
+        stage_id=s.stage_id,
+        output_key=out.logical_slot,
+        logical_slot=out.logical_slot,
+        mode=mode,
+        executor_kind=s.executor_kind,
+        control_role=s.control_role,
+        cost_mode=s.cost_mode,
+        allowed_tool_effects=tuple(sorted(s.allowed_tool_effects, key=lambda e: e.value)),
+        output_artifact_type=out.artifact_type,
+        output_schema_version=out.schema_version,
+        output_partitioning_kind=out.partitioning.kind,
+        output_from_key=out.partitioning.from_key,
+        requirements=(),
+        partition_source=None,
+        driver_stage=None,
+        upstream_stage=None,
+        externally_scheduled=True,
+        gated=s.gated,
+    )
 
 
 def _classify(
